@@ -17,7 +17,7 @@ CORS(app)
 def index():
     return render_template('./index.html')
 
-#game = gomoku_ai.PureMCTSGame8(5.0, False)
+#game = gomoku_ai.PureMCTSGame11(5.0, False)
 game = None
 
 @app.route('/handle_state', methods=['POST'])
@@ -33,12 +33,12 @@ def move():
     boardArr[x][y] = 0
     np_board = np.array(boardArr, dtype=np.int32)
     if (not game) or (not game.StateEquals(np_board, False)):
-        if np.array_equal(np_board, np.zeros((8, 8), dtype=np.int32)):
+        if np.array_equal(np_board, np.zeros((11, 11), dtype=np.int32)):
             print("Initializing a new game!")
         else:
             print("WARING: Re-Initializing the game unexpectedly!")
         np_board[x][y] = 1
-        game = gomoku_ai.PureMCTSGame8(np_board, (x, y), 2.0, True)
+        game = gomoku_ai.PureMCTSGame11(np_board, (x, y), 2.0, True)
     else:
         game.Play(x, y)
 
@@ -49,7 +49,7 @@ def move():
         print("Human win!")
         return jsonify({'result' : 'win'})
 
-    search_times = 1000
+    search_times = 200000
     start_time = datetime.now()
     ai_x, ai_y = game.SearchBestMove(search_times)
     time_cost = (datetime.now() - start_time).total_seconds()
