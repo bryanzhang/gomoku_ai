@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>五子棋对战 AI</title>
+    <style>
+        canvas {
+            border: 1px solid #000;
+        }
+    </style>
+</head>
+<body>
+    <h1>五子棋对战 AI</h1>
+    <canvas id="chessboard" width="600" height="600"></canvas>
+    <p id="message"></p>
+    <button id="restart">重新开始</button>
+
+    <script>
+        const canvas = document.getElementById('chessboard');
+        const ctx = canvas.getContext('2d');
+        const message = document.getElementById('message');
+        const restartBtn = document.getElementById('restart');
+
+        // const boardSize = 15; // 15x15的棋盘
+        // const boardSize = 9; // 9x9的棋盘
+        const boardSize = 8; // 9x9的棋盘
+        const cellSize = canvas.width / boardSize;
+
+        let board = []; // 前端的棋盘状态
+        let gameOver = false;
+
+        // 初始化棋盘
+        function initBoard() {
+            board = [];
+            for (let i = 0; i < boardSize; i++) {
+                board[i] = [];
+                for (let j = 0; j < boardSize; j++) {
+                    board[i][j] = 0; // 0表示空位
+                }
+            }
+            gameOver = false;
+            message.textContent = '';
+            drawBoard();
+        }
+
+        // 绘制棋盘
+        function drawBoard() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // 绘制网格线
+            for (let i = 0; i < boardSize; i++) {
+                ctx.beginPath();
+                ctx.moveTo(cellSize / 2, cellSize / 2 + i * cellSize);
+                ctx.lineTo(canvas.width - cellSize / 2, cellSize / 2 + i * cellSize);
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.moveTo(cellSize / 2 + i * cellSize, cellSize / 2);
+                ctx.lineTo(cellSize / 2 + i * cellSize, canvas.height - cellSize / 2);
+                ctx.stroke();
+            }
+            // 绘制棋子
+            for (let x = 0; x < boardSize; x++) {
+                for (let y = 0; y < boardSize; y++) {
+                    if (board[x][y] === 1) {
+                        // 玩家棋子（黑色）
+                        drawPiece(x, y, true);
+                    } else if (board[x][y] === -1) {
+                        // AI棋子（白色）
+                        drawPiece(x, y, false);
+                    }
+                }
+            }
+        }
+
+        // 绘制棋子
+        function drawPiece(x, y, isPlayer) {
+            ctx.beginPath();
+            ctx.arc(
+                cellSize / 2 + x * cellSize,
+                cellSize / 2 + y * cellSize,
+                cellSize / 2 - 4,
+                0,
+                2 * Math.PI
+            );
+            ctx.closePath();
+            const gradient = ctx.createRadialGradient(
+                cellSize / 2 + x * cellSize + 2,
+                cellSize / 2 + y * cellSize - 2,
+                cellSize / 2 - 4,
+                cellSize / 2 + x * cellSize,
+                cellSize / 2 + y * cellSize,
+                0
+            );
+            if (isPlayer) {
+                // 黑色棋子
+                gradient.addColorStop(0, '#0A0A0A');
+                gradient.addColorStop(1, '#636766');
+            } else {
+                // 白色棋子
+                gradient.addColorStop(0, '#D1D1D1');
+                gradient.addColorStop(1, '#F9F9F9');
+            }
+            ctx.fillStyle = gradient;
+            ctx.fill();
+        }
+
+        // 处理鼠标点击事件
+        canvas.onclick = function(e) {
+            if (gameOver) return;
+            const rect = canvas.getBoundingClientRect();
+            const x = Math.floor((e.clientX - rect.left) / cellSize);
+            const y = Math.floor((e.clientY - rect.top) / cellSize);
+
+            // 判断该位置是否为空
+            if (board[x][y] !== 0) return;
+
+            // 玩家落子
+            board[x][y] = 1;
+            drawBoard();
+
+            // 检查是否胜利
+            fetch('/handle_state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({'board' : board, 'x' : x, 'y' : y})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.result === 'win') {
+                    message.textContent = '你赢了！';
+                    gameOver = true;
+                } else if (data.result === 'lose') {
+                    // AI 落子
+                    const [ai_x, ai_y] = data.ai_move;
+                    board[ai_x][ai_y] = -1;
+                    drawBoard();
+                    message.textContent = 'AI赢了！';
+                    gameOver = true;
+                } else if (data.result === 'continue') {
+                    // AI 落子
+                    const [ai_x, ai_y] = data.ai_move;
+                    board[ai_x][ai_y] = -1;
+                    drawBoard();
+
+                    // 检查是否平局或胜利
+                    if (data.status === 'draw') {
+                        message.textContent = '平局！';
+                        gameOver = true;
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+            });
+        };
+
+        // 重新开始按钮
+        restartBtn.onclick = function() {
+            fetch('/restart', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                if (data.result === 'ok') {
+                    initBoard();
+                }
+            });
+        };
+
+        // 初始化游戏
+        initBoard();
+    </script>
+</body>
+</html>
+
+
+
