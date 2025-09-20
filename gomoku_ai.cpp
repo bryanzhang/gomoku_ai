@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <bitset>
+#include <cstdint>
 #include <iostream>
-#include <map>
+#include <vector>
 #include <random>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -8,13 +10,45 @@
 
 namespace py = pybind11;
 
+struct High8Compare {
+    bool operator()(uint64_t a, uint64_t b) const noexcept {
+        return (a & 0xFF00000000000000) < (b & 0xFF00000000000000);
+    }
+};
+
+// find the first >= target iterator.
+auto find_insertion_point(std::vector<uint64_t>& vec, uint8_t key) {
+    uint64_t key_pattern = static_cast<uint64_t>(key) << 56;
+    return std::lower_bound(vec.begin(), vec.end(), key_pattern, High8Compare());
+}
+
+bool try_insert_sorted(std::vector<uint64_t>& vec, uint64_t value) {
+    uint8_t key = value >> 56;
+    auto it = find_insertion_point(vec, key);
+    
+    if ((it != vec.end() && (*it >> 56) == key)) {
+        return false;
+    }
+    
+    vec.insert(it, value);
+    return true;
+}
+
+auto find_by_key(const std::vector<uint64_t>& vec, uint8_t key) {
+    uint64_t key_pattern = static_cast<uint64_t>(key) << 56;
+    auto it = std::lower_bound(vec.begin(), vec.end(), key_pattern, High8Compare());
+    
+    if (it != vec.end() && (*it >> 56) == key) {
+        return it;
+    }
+    return vec.end();
+}
+
 namespace gomoku_ai {
 typedef std::pair<int, int> Move;  // first->x,second->y
 std::string format(const char* fmt, ...) {
-    // 初始化变参列表
     va_list args;
     
-    // 第一次调用：获取格式化字符串所需的长度（不包括终止符）
     va_start(args, fmt);
     int length = vsnprintf(nullptr, 0, fmt, args); // C++11 标准规定，若buf为nullptr且size为0，则返回所需字节数（不含空终止符）
     va_end(args);
@@ -23,23 +57,21 @@ std::string format(const char* fmt, ...) {
         return ""; // 格式化错误，返回空字符串
     }
     
-    // 根据计算得到的长度分配缓冲区，多分配一个字节用于存放空终止符'\0'
     size_t buf_size = length + 1;
     std::vector<char> buf(buf_size);
     
-    // 第二次调用：实际进行格式化，将字符串写入缓冲区
     va_start(args, fmt);
     vsnprintf(buf.data(), buf_size, fmt, args); // 使用vector的data()成员函数获取裸指针
     va_end(args);
     
-    // 将C风格字符串转换为std::string并返回
     return std::string(buf.data());
 }
 
 template <int BOARD_SIZE>
 struct TreeNode {
     TreeNode* parent_;
-    std::map<int, TreeNode*> children_;
+    // std::map<int, TreeNode*> children_;
+    std::vector<uint64_t> children_;
     std::bitset<BOARD_SIZE * BOARD_SIZE> availables_;
     std::bitset<BOARD_SIZE * BOARD_SIZE> blacks_;
     int visits_ = 0;
@@ -58,7 +90,8 @@ struct TreeNode {
     ~TreeNode() {
         // 不管parent的内存
         for (auto itr = children_.begin(); itr != children_.end(); ++itr) {
-            delete itr->second;
+            auto ptr = (TreeNode*)((*itr) & 0x00ffffffffffffff);
+            delete ptr;
         }
     }
     
@@ -118,7 +151,7 @@ struct TreeNode {
         return false;
     }        
 
-    int SelectAndExpand(std::mt19937& engine, float c_puct, bool is_black) {
+    auto SelectAndExpand(std::mt19937& engine, float c_puct, bool is_black) {
         float max_q = -1.0;
         std::vector<int> candidates;
         for (int i = 0; i < BOARD_SIZE* BOARD_SIZE; ++i) {
@@ -126,11 +159,11 @@ struct TreeNode {
                 continue;
             }
 
-            auto itr = children_.find(i);
+            auto itr = find_by_key(children_, (uint8_t)i);
             float q = 0;
             float puct = c_puct * sqrt(visits_);
             if (itr != children_.end()) {
-                auto* child = itr->second;
+                auto* child = (TreeNode*)(*itr & 0x00ffffffffffffff);
                 q = (float)child->scores_ / child->visits_;
                 puct /= (child->visits_ + 1);
             }
@@ -146,11 +179,14 @@ struct TreeNode {
 
         std::uniform_int_distribution<int> distribution(0, (int)candidates.size() - 1);
         int child_idx = candidates[distribution(engine)];
-        if (children_.find(child_idx) == children_.end()) {
+        auto itr = find_insertion_point(children_, (uint8_t)child_idx);
+        if (itr == children_.end() || (*itr >> 56) != (uint64_t)child_idx) {
             auto* entry = new TreeNode<BOARD_SIZE>(this, child_idx, is_black);
-            children_[child_idx] = entry;
+            auto elem = ((uint64_t)entry | ((uint64_t)child_idx << 56));
+            return children_.insert(itr, elem);
+        } else {
+            return itr;
         }
-        return child_idx;
     }
 
     void UpdateRecursively(int score) {
@@ -254,14 +290,16 @@ public:
         }
         if (!reuse_tree_states_) {
             new_root = new TreeNode<BOARD_SIZE>(root_, child_idx, !is_last_black_);
-        } else { 
-            if (root_->children_.find(child_idx) == root_->children_.end()) {
+        } else {
+            auto itr = find_insertion_point(root_->children_, (uint8_t)child_idx);
+            if (itr == root_->children_.end() || (*itr >> 56) > (uint64_t)child_idx) {
                  auto* entry = new TreeNode<BOARD_SIZE>(root_, child_idx, !is_last_black_);
-                 root_->children_[child_idx] = entry;
+                 auto elem = ((uint64_t)entry | ((uint64_t)child_idx << 56));
+                 root_->children_.insert(itr, elem);
             }
-            auto itr = root_->children_.find(child_idx);
-            new_root = itr->second;
-            root_->children_.erase(itr);
+            auto it = find_by_key(root_->children_, (uint8_t)child_idx);
+            new_root = (TreeNode<BOARD_SIZE>*)(*it & 0x00ffffffffffffff);
+            root_->children_.erase(it);
         }
         new_root->parent_ = nullptr;
         delete root_;
@@ -301,10 +339,11 @@ Move PureMCTSGame<BOARD_SIZE>::SearchBestMove(int simulate_times) {
         Move last_move = last_move_;
         bool is_last_black = is_last_black_;
         while (!node->IsEnd(last_move, is_last_black)) {  // step 3: simulate
-            auto idx = node->SelectAndExpand(engine, c_puct_, !is_last_black);  // step 1&2: expand->select
+            auto itr = node->SelectAndExpand(engine, c_puct_, !is_last_black);  // step 1&2: expand->select
+            auto idx = (int)(*itr >> 56);
             last_move = { (idx % BOARD_SIZE), (idx / BOARD_SIZE) };
             is_last_black = !is_last_black;
-            node = node->children_[idx];
+            node = (TreeNode<BOARD_SIZE>*)(*itr & 0x00ffffffffffffff);
         }
         int score = 0;
         if (node->availables_.count() > 0) {
@@ -317,12 +356,14 @@ Move PureMCTSGame<BOARD_SIZE>::SearchBestMove(int simulate_times) {
     std::vector<Move> best_actions;
     int max_visits = 0;
     for (auto itr = root_->children_.begin(); itr != root_->children_.end(); ++itr) {
-        if (itr->second->visits_ > max_visits) {
-            max_visits = itr->second->visits_;
+        auto* child = (TreeNode<BOARD_SIZE>*)(*itr & 0x00ffffffffffffff);
+        auto idx = (int)(*itr >> 56);
+        if (child->visits_ > max_visits) {
+            max_visits = child->visits_;
             best_actions.clear();
         }
-        if (itr->second->visits_ == max_visits) {
-            best_actions.emplace_back(Move((itr->first % BOARD_SIZE), itr->first / BOARD_SIZE));
+        if (child->visits_ == max_visits) {
+            best_actions.emplace_back(Move((idx % BOARD_SIZE), idx / BOARD_SIZE));
         }
     }
 
