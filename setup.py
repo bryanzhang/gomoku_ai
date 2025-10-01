@@ -9,8 +9,13 @@ ext_modules = [
         'gomoku_ai',
         ['gomoku_ai.cpp'],
         include_dirs=[pybind11.get_include()],
-        language='c++',
-        extra_compile_args=['-std=c++20', '-g', '-O3'],
+        libraries=['stdc++',],
+        library_dirs=['/usr/local/lib'],
+        language='clang++',
+        #language='g++',
+        #extra_compile_args=['-x', 'c++', '-std=c++17', '-g', '-O3', '-fPIC', '-fsanitize=address', '-fno-omit-frame-pointer'],
+        extra_compile_args=['-x', 'c++', '-std=c++17', '-g', '-O3', '-fPIC',],
+        extra_link_args=['-g', '-L/usr/local/lib', '-lfolly', '-ldl', '-lgflags', '-lglog', '-lpthread', '-lfmt', '-lunwind', '-ldouble-conversion', '-liberty', '-lstdc++', '-levent', '-lboost_context',],
     ),
 ]
 
