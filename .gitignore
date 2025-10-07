@@ -2,3 +2,5 @@ build
 *.so
 *.swo
 *.swp
+core
+webserver

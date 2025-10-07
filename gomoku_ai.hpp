@@ -56,14 +56,12 @@ inline void invalidate_cache_region_atomic(void* data_ptr, size_t size) {
     auto* masked_data_ptr = (void*)((uint64_t)data_ptr & 0xffffffffffffff40uLL);
     auto adjusted_size = size + ((uint8_t*)data_ptr - (uint8_t*)masked_data_ptr);
     auto* ptr = static_cast<std::atomic<uintptr_t>*>(masked_data_ptr);
-    size_t count = (adjusted_size + 63) / 64;
-    
-    for (size_t i = 0; i < count; ++i) {
-        // 原子操作可能生成lock指令
-        ptr[i * (64 / sizeof(uintptr_t))].fetch_or(0, std::memory_order_acq_rel);
+   
+    for (size_t i = 0; i < adjusted_size; ++i, ptr += 64 / sizeof(uintptr_t)) { 
+        (*ptr).fetch_or(0, std::memory_order_acq_rel);
     }
     
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void MakeChildrenVisible(std::vector<uint64_t>& children) {
@@ -186,12 +184,12 @@ public:
 
     void print_list() {
         HPRecType<TYPE>* p = head_;
-        std::cerr << "HP_LIST: ";
+        // std::cerr << "HP_LIST: ";
         while (p) {
-            std::cerr << p->active_ << "|" << p->hazard_ << " -> ";
+            // std::cerr << p->active_ << "|" << p->hazard_ << " -> ";
             p = p->next_;
         }
-        std::cerr << std::endl;
+        // std::cerr << std::endl;
     }
 
 private:
@@ -224,6 +222,7 @@ struct TreeNode {
     ~TreeNode() {
         // 不管parent的内存
         std::vector<uint64_t>* children = children_;
+        // std::cerr << format("Reclaim %zu children entries!\n", children->size());
         for (auto itr = children->begin(); itr != children->end(); ++itr) {
             auto ptr = (TreeNode*)((*itr) & 0x00ffffffffffffff);
             delete ptr;
@@ -298,11 +297,11 @@ struct TreeNode {
             old_value = concurrency_visits_score_;
             new_value = ((((old_value >> 56) + 1) << 56) | (old_value & 0x00ffffffffffffffuLL));
         } while (!concurrency_visits_score_.compare_exchange_strong(old_value, new_value));
-        std::cerr << format("WEAKLOCK: %llx -> %llx\n", old_value, new_value);
+        // std::cerr << format("WEAKLOCK: %llx -> %llx\n", old_value, new_value);
         return new_value;
     }
 
-    auto SelectAndExpand(int task_idx, HPList<std::vector<uint64_t>>& hp_list, std::vector<std::vector<uint64_t>*>& retire_list, std::mt19937& engine, float c_puct, bool is_black) {
+    uint64_t SelectAndExpand(int task_idx, HPList<std::vector<uint64_t>>& hp_list, std::vector<std::vector<uint64_t>*>& retire_list, std::mt19937& engine, float c_puct, bool is_black) {
         float max_q = -1.0;
         std::vector<int> candidates;
 
@@ -342,7 +341,7 @@ struct TreeNode {
 
         std::uniform_int_distribution<int> distribution(0, (int)candidates.size() - 1);
         int child_idx = candidates[distribution(engine)];
-        std::cerr << format("Task#%d Selected child index: %d\n", task_idx, child_idx);
+        // std::cerr << format("Task#%d Selected child index: %d\n", task_idx, child_idx);
         for (; ;) {
             HPRecType<std::vector<uint64_t>>* p_rec = hp_list.Acquire();
             std::vector<uint64_t>* old_children;
@@ -354,22 +353,24 @@ struct TreeNode {
             auto itr = find_insertion_point(*old_children, (uint8_t)child_idx);
             if (itr != old_children->end() && (*itr >> 56) == child_idx) {
                 p_rec->Release();
-                return itr;
+                return *itr;
             }
-            std::cerr << format("SIZE: %llu\n", itr - old_children->begin()); 
+            // std::cerr << format("SIZE: %llu\n", itr - old_children->begin()); 
             std::vector<uint64_t>* children = new std::vector<uint64_t>(old_children->begin(), itr);
             auto* entry = new TreeNode<BOARD_SIZE>(this, child_idx, is_black);
             entry->MakeVisible();
             auto elem = ((uint64_t)entry | ((uint64_t)child_idx << 56));
-            std::vector<uint64_t>::iterator ret = children->insert(children->end(), elem);
+            // std::cerr << format("ELEM: %llx\n", elem);
+            children->insert(children->end(), elem);
             children->insert(children->end(), itr, old_children->end());
             MakeChildrenVisible(*children);
             if (children_.compare_exchange_strong(old_children, children)) {
                 p_rec->Release();
                 hp_list.Retire(retire_list, old_children);
-                std::cerr << format("Task#%d Children size after select and expand: %d\n", task_idx, children_.load()->size());
-                return ret;
+                // std::cerr << format("Task#%d Children size after select and expand: %d,itr=%llx\n", task_idx, children_.load()->size(), elem);
+                return elem;
             }
+            delete entry;
             delete children;
             p_rec->Release();
         }
@@ -391,7 +392,7 @@ struct TreeNode {
             scores += score;
             new_value = ( ((uint64_t)concurrency << 56) | ((uint64_t)visits << 32) | (uint64_t)(uint32_t)scores );
         } while (!concurrency_visits_score_.compare_exchange_strong(old_value, new_value));
-        std::cerr << format("Update State: %llx -> %llx\n", old_value, new_value);
+        // std::cerr << format("Update State: %llx -> %llx\n", old_value, new_value);
     }
 };
 
@@ -443,6 +444,74 @@ public:
             }
             is_last_black_ = root_->blacks_[index];
         }
+    }
+
+    PureMCTSGame(int cores, std::vector<std::vector<int>>& board, Move last_move, float c_puct, bool reuse_tree_states = false) : executor_(cores, cores), root_(new TreeNode<BOARD_SIZE>()), last_move_(last_move), c_puct_(c_puct), reuse_tree_states_(reuse_tree_states) {
+        if (last_move_.first >= BOARD_SIZE || last_move_.second >= BOARD_SIZE) {
+            throw std::runtime_error(format("Last move(%d,%d) is out of board(board size:%d)!", last_move.first, last_move.second, BOARD_SIZE));
+        }
+
+        for (int y = 0; y < BOARD_SIZE; ++y) {
+           for (int x = 0; x < BOARD_SIZE; ++x) {
+               int index = y * BOARD_SIZE + x;
+               if (board[x][y] == 1) {
+                   root_->availables_.set(index, false);
+                   root_->blacks_.set(index, true);
+               } else if (board[x][y] == -1) {
+                   root_->availables_.set(index, false);
+                   root_->blacks_.set(index, false);
+               } else if (board[x][y] == 0) {
+                   root_->availables_.set(index, true);
+                   root_->blacks_.set(index, false);
+               } else {
+                   throw std::runtime_error(format("Board(%d,%d) = %d is not in [-1, 0, 1]!", x, y, board[y][x]));
+               }
+           }
+        }
+        if (last_move_.first < 0 || last_move_.second < 0) {
+            if (root_->availables_.count() != BOARD_SIZE * BOARD_SIZE) {
+                throw std::runtime_error(format("NO last action but there are %d picies on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
+            }
+            is_last_black_ = false;  // 强要求黑棋先走
+        } else {
+            int index = last_move_.second * BOARD_SIZE + last_move_.first;
+            if (root_->availables_[index]) {
+                throw std::runtime_error(format("The move(%d,%d) hasnot been made!", last_move.first, last_move.second));
+            }
+            is_last_black_ = root_->blacks_[index];
+        }
+    }
+
+    ~PureMCTSGame() {
+        std::cerr << "Reclaim root...\n";
+        delete root_;
+    }
+
+    bool StateEquals(std::vector<std::vector<int>>& board, bool is_last_black) const {
+        if (is_last_black != is_last_black_) {
+            return false;
+        }
+
+        auto availables = root_->availables_;
+        auto blacks = root_->blacks_;
+        for (int y = 0; y < BOARD_SIZE; ++y) {
+           for (int x = 0; x < BOARD_SIZE; ++x) {
+               int index = y * BOARD_SIZE + x;
+               if (board[x][y] == 1) {
+                   availables.set(index, false);
+                   blacks.set(index, true);
+               } else if (board[x][y] == -1) {
+                   availables.set(index, false);
+                   blacks.set(index, false);
+               } else if (board[x][y] == 0) {
+                   availables.set(index, true);
+                   blacks.set(index, false);
+               } else {
+                   throw std::runtime_error(format("Board(%d,%d) = %d is not in [-1, 0, 1]!", x, y, board[y][x]));
+               }
+           }
+        }
+        return (availables == root_->availables_ && blacks == root_->blacks_); 
     }
 
     bool StateEquals(py::array_t<int32_t> board, bool is_last_black) const {
@@ -500,11 +569,23 @@ public:
             root_children->erase(it);
         }
         new_root->parent_ = nullptr;
-        delete root_;
+
+        std::vector<folly::Future<folly::Unit>> futures;
+        std::vector<uint64_t>* root_children = root_->children_;
+        for (auto itr = root_children->begin(); itr != root_children->end(); ++itr) {
+            auto ptr = (TreeNode<BOARD_SIZE>*)((*itr) & 0x00ffffffffffffff);
+            auto fut = folly::via(&executor_, [ptr]() { delete ptr; });
+            futures.emplace_back(std::move(fut));
+        }
+        delete root_children;
+        ::operator delete(root_);
         root_ = new_root;
-        std::cerr << format("New root children size: %d\n", (int)root_->children_.load()->size());
+        // std::cerr << format("New root children size: %d\n", (int)root_->children_.load()->size());
         last_move_ = { x, y };
         is_last_black_ = !is_last_black_;
+        for (auto& fut : futures) {
+            std::move(fut).get();
+        }
    }
 
     bool IsEnd() const {
@@ -519,12 +600,11 @@ public:
     
         std::atomic<int> finished_count = 0;
         HPList<std::vector<uint64_t>> hp_list;
-        std::vector<void*> retire_lists(simulate_times, nullptr);
+        std::vector<std::vector<std::vector<uint64_t>*>> retire_lists(simulate_times);
     
         MakeAllVisible();
         std::vector<folly::Future<folly::Unit>> futures;
         for (int i = 0; i < simulate_times; ++i) {
-            // futures.emplace_back(executor_.add([this, &hp_list, &finished_count, i, &retire_lists]() { this->Ruleout(hp_list, finished_count, i, retire_lists); }));
             folly::Future<folly::Unit> fut = folly::via(&executor_, [this, &hp_list, &finished_count, i, &retire_lists]() { this->Ruleout(hp_list, finished_count, i, retire_lists); });
             futures.emplace_back(std::move(fut));
         }
@@ -534,36 +614,36 @@ public:
             auto& fut = *itr;
             try {
                 std::move(fut).get();
-                std::cerr << format("Task #%d executed successfully!\n", (int)(itr - futures.begin()));
+                // std::cerr << format("Task #%d executed successfully!\n", (int)(itr - futures.begin()));
             } catch (std::exception& e) {
-                std::cerr << format("Task #%d failed with exception: %s\n", (int)(itr - futures.begin()), e.what());
+                // std::cerr << format("Task #%d failed with exception: %s\n", (int)(itr - futures.begin()), e.what());
             }
         }
     
         if (__builtin_expect(finished_count != simulate_times, 0)) {  // unlikely
-            std::cerr << "Warning: Finished cout is actually " << finished_count << ", expected is" << simulate_times << std::endl;
+            // std::cerr << "Warning: Finished cout is actually " << finished_count << ", expected is" << simulate_times << std::endl;
         }
         hp_list.print_list();
+        size_t total_rlist_size = 0;
         for (auto itr = retire_lists.begin(); itr != retire_lists.end(); ++itr) {
-            if (*itr == nullptr) {
-                continue;
-            }
-            hp_list.TryReclaim(*(std::vector<std::vector<uint64_t>*>*)*itr);
+            total_rlist_size += itr->size();
+            hp_list.TryReclaim(*itr);
         }
-    
+        std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
+ 
         // find the most visited.
         std::vector<Move> best_actions;
         uint32_t max_visits = 0;
         std::vector<uint64_t>* root_children = root_->children_;
-        std::cerr << "Traversing...\n";
-        std::cerr << "Children count: " << root_children->size() << std::endl;
+        // std::cerr << "Traversing...\n";
+        // std::cerr << "Children count: " << root_children->size() << std::endl;
         for (auto itr = root_children->begin(); itr != root_children->end(); ++itr) {
             auto* child = (TreeNode<BOARD_SIZE>*)(*itr & 0x00ffffffffffffff);
             auto idx = (int)(*itr >> 56);
             uint64_t concurrency_visits_score = child->concurrency_visits_score_;
             uint32_t concurrency = (uint32_t)(concurrency_visits_score >> 56);
             uint32_t child_visits = ((uint32_t)(concurrency_visits_score >> 32) & 0xffffffu);
-            std::cerr << "IDX: " << idx << " CONCURRENCY: " << concurrency << " VISITS: " << child_visits << std::endl;
+            // std::cerr << "IDX: " << idx << " CONCURRENCY: " << concurrency << " VISITS: " << child_visits << std::endl;
             if (child_visits > max_visits) {
                 max_visits = child_visits;
                 best_actions.clear();
@@ -573,14 +653,14 @@ public:
             }
         }
     
-        std::cerr << "Max visits: " << max_visits << std::endl;
-        std::cerr << "Initializing random device..." << std::endl;
+        // std::cerr << "Max visits: " << max_visits << std::endl;
+        // std::cerr << "Initializing random device..." << std::endl;
         std::random_device rd;
-        std::cerr << "Initializing engine..." << std::endl;
+        // std::cerr << "Initializing engine..." << std::endl;
         std::mt19937 engine(rd());
     
-        std::cerr << "Best action count: " << best_actions.size() << std::endl;
-        std::cerr << "Generating random number..." << std::endl;
+        // std::cerr << "Best action count: " << best_actions.size() << std::endl;
+        // std::cerr << "Generating random number..." << std::endl;
         std::uniform_int_distribution<int> distribution(0, (int)best_actions.size() - 1);
         return best_actions[distribution(engine)];
     }
@@ -599,23 +679,20 @@ public:
         return engine;
     }
     
-    void Ruleout(HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, std::vector<void*> retire_lists) {
-        thread_local std::vector<std::vector<uint64_t>*> retire_list;
+    void Ruleout(HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, std::vector<std::vector<std::vector<uint64_t>*>>& retire_lists) {
+        std::vector<std::vector<uint64_t>*> retire_list;
         auto& engine = get_threadlocal_generator();
-    
-        std::cerr << format("Task #%d Registrying retire list...\n", task_idx);
-        retire_lists[task_idx] = &retire_list;  // registry
     
         TreeNode<BOARD_SIZE>* node = root_;
         Move last_move = last_move_;
         bool is_last_black = is_last_black_;
         node->WeakLock();
         while (!node->IsEnd(last_move, is_last_black)) {  // step 3: simulate
-            auto itr = node->SelectAndExpand(task_idx, hp_list, retire_list, engine, c_puct_, !is_last_black);  // step 1&2: expand->select
-            auto idx = (int)(*itr >> 56);
+            auto elem = node->SelectAndExpand(task_idx, hp_list, retire_list, engine, c_puct_, !is_last_black);  // step 1&2: expand->select
+            auto idx = (int)(elem >> 56);
             last_move = { (idx % BOARD_SIZE), (idx / BOARD_SIZE) };
             is_last_black = !is_last_black;
-            node = (TreeNode<BOARD_SIZE>*)(*itr & 0x00ffffffffffffffuLL);
+            node = (TreeNode<BOARD_SIZE>*)(elem & 0x00ffffffffffffffuLL);
             node->WeakLock();
         }
         int score = 0;
@@ -628,6 +705,7 @@ public:
         if (__builtin_expect((count % 100000) == 0, 0)) {  // unlikely
             std::cout << format("Ruleout count: %d\n", count); 
         }
+        retire_lists[task_idx] = std::move(retire_list);  // registry
     }
 
 private:
