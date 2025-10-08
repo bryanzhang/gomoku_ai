@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#include <thread>
+#include <map>
+#include <shared_mutex>
 #include <vector>
 #include <random>
 #include <folly/executors/CPUThreadPoolExecutor.h>
@@ -110,7 +113,7 @@ struct HPRecType {
 };
 
 // Hazard pointer list
-template <class TYPE, size_t R = 10>
+template <class TYPE, size_t R = 1000>
 class HPList {
 public:
     HPList(size_t prealloc_size) {
@@ -135,7 +138,6 @@ public:
        }
 
        // increment the list length
-       std::cerr << "New HPRec entry!\n";
        p = new HPRecType<TYPE>();
        p->active_ = true;
        HPRecType<TYPE>* old;
@@ -208,6 +210,44 @@ public:
 private:
     std::atomic<HPRecType<TYPE>*> head_ = nullptr;
 };
+
+template <class TYPE>
+class MTRetireLists {
+public:
+    void InheritThreadLocalRetireList(std::vector<TYPE*>& retire_list) {
+        std::thread::id this_id = std::this_thread::get_id();
+        {
+        std::shared_lock rlock(mutex_);
+        auto itr = lists_.find(this_id);
+        if (itr == lists_.end() || itr->second.empty()) {
+            return;
+        }
+        }
+
+        std::unique_lock wlock(mutex_);
+        retire_list = std::move(lists_[this_id]);
+    }
+
+    void UpdateThreadLocalRetireList(std::vector<TYPE*>&& retire_list) {
+        if (retire_list.empty()) {
+            return;
+        }
+
+        std::thread::id this_id = std::this_thread::get_id();
+        std::unique_lock wlock(mutex_);
+        lists_[this_id] = retire_list;
+    }
+
+    std::map<std::thread::id, std::vector<TYPE*>>& GetLists() {
+        std::unique_lock wlock(mutex_);
+        return lists_;
+    }
+
+private:
+    mutable std::shared_mutex mutex_;
+    std::map<std::thread::id, std::vector<TYPE*>> lists_;
+};
+
 
 template <int BOARD_SIZE>
 struct TreeNode {
@@ -629,8 +669,8 @@ public:
     
         std::atomic<int> finished_count = 0;
         HPList<std::vector<uint64_t>> hp_list(100);
-        std::vector<std::vector<std::vector<uint64_t>*>> retire_lists(simulate_times);
-    
+        MTRetireLists<std::vector<uint64_t>> retire_lists;
+ 
         MakeAllVisible();
         std::vector<folly::Future<folly::Unit>> futures;
         for (int i = 0; i < simulate_times; ++i) {
@@ -654,9 +694,10 @@ public:
         }
         hp_list.print_list();
         size_t total_rlist_size = 0;
-        for (auto itr = retire_lists.begin(); itr != retire_lists.end(); ++itr) {
-            total_rlist_size += itr->size();
-            hp_list.TryReclaim(*itr);
+        auto& rl_data = retire_lists.GetLists();
+        for (auto itr = rl_data.begin(); itr != rl_data.end(); ++itr) {
+            total_rlist_size += itr->second.size();
+            hp_list.TryReclaim(itr->second);
         }
         std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
  
@@ -708,8 +749,9 @@ public:
         return engine;
     }
     
-    void Ruleout(HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, std::vector<std::vector<std::vector<uint64_t>*>>& retire_lists) {
+    void Ruleout(HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, MTRetireLists<std::vector<uint64_t>>& retire_lists) {
         std::vector<std::vector<uint64_t>*> retire_list;
+        retire_lists.InheritThreadLocalRetireList(retire_list);
         auto& engine = get_threadlocal_generator();
     
         TreeNode<BOARD_SIZE>* node = root_;
@@ -734,7 +776,7 @@ public:
         if (__builtin_expect((count % 100000) == 0, 0)) {  // unlikely
             std::cout << format("Ruleout count: %d\n", count); 
         }
-        retire_lists[task_idx] = std::move(retire_list);  // registry
+        retire_lists.UpdateThreadLocalRetireList(std::move(retire_list));
     }
 
 private:

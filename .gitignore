@@ -3,4 +3,4 @@ build
 *.swo
 *.swp
 core
-webserver
+web_server
