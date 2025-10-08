@@ -94,7 +94,7 @@ public:
         }
         
         // AI移动
-        int search_times = 800000;
+        int search_times = 1000000;
         auto start_time = std::chrono::steady_clock::now();
         auto [ai_x, ai_y] = currentGame->SearchBestMove(search_times);
         auto time_cost = std::chrono::duration_cast<std::chrono::milliseconds>(
