@@ -11,11 +11,11 @@
 
 #include "crow.h"
 #include "nlohmann/json.hpp"
-#include "gomoku_ai.hpp"
+#include "alphazero_mcts.hpp"
 
 using json = nlohmann::json;
 constexpr int BOARD_SIZE = 11;
-using GomokuAI = gomoku_ai::PureMCTSGame<BOARD_SIZE>;
+using GomokuAI = gomoku_ai::GomokuMCTSFramework<BOARD_SIZE, false>;
 
 // 在程序启动时初始化Python解释器
 bool init_python_environment() {

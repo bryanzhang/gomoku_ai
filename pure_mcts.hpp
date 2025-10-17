@@ -1,5 +1,5 @@
-#ifndef GOMOKU_AI_HPP_
-#define GOMOKU_AI_HPP_
+#ifndef ALPHAZERO_MCTS_HPP_
+#define ALPHAZERO_MCTS_HPP_
 
 #include <algorithm>
 #include <bitset>
@@ -661,6 +661,28 @@ public:
         return root_->IsEnd(last_move_, is_last_black_);
     }
 
+    Move SearchBestMoveWithModel(int simulate_times, float temperature, bool dirichlet_noise) {
+        Move ret = { -1, -1 };
+        if (root_->IsEnd(last_move_, is_last_black_)) {
+            return ret;
+        }
+
+        std::atomic<int> finished_count = 0;
+        HPList<std::vector<uint64_t>> hp_list(100);
+        MTRetireLists<std::vector<uint64_t>> retire_lists;
+
+        MakeVisible();
+        std::vector<folly::Future<folly::Unit>> futures;
+        for (int i = 0; i < simulate_times; ++i) {
+            folly::Future<folly::Unit> fut = folly::via(&executor_, [this, &hp_list, &finished_count, i, &retire_lists, &prior_move_probs, estimated_value]() { this->RolloutWithModel(hp_list, finished_count, i, retire_lists, prior_move_probs, estimated_value); });
+            futures.emplace_back(std::mvoe(fut));
+        }
+        for (auto itr = futures.begin(); itr != futures.end(); ++itr) {
+            auto& fut = *itr;
+            std::move(fut).get();
+        }
+    }
+
     Move SearchBestMove(int simulate_times) {
         Move ret = { -1, -1 };
         if (root_->IsEnd(last_move_, is_last_black_)) {
@@ -674,25 +696,14 @@ public:
         MakeAllVisible();
         std::vector<folly::Future<folly::Unit>> futures;
         for (int i = 0; i < simulate_times; ++i) {
-            folly::Future<folly::Unit> fut = folly::via(&executor_, [this, &hp_list, &finished_count, i, &retire_lists]() { this->Ruleout(hp_list, finished_count, i, retire_lists); });
+            folly::Future<folly::Unit> fut = folly::via(&executor_, [this, &hp_list, &finished_count, i, &retire_lists]() { this->Rollout(hp_list, finished_count, i, retire_lists); });
             futures.emplace_back(std::move(fut));
         }
-        // executor_.join();
-        // for (auto& fut : futures) {
         for (auto itr = futures.begin(); itr != futures.end(); ++itr) {
             auto& fut = *itr;
-            try {
-                std::move(fut).get();
-                // std::cerr << format("Task #%d executed successfully!\n", (int)(itr - futures.begin()));
-            } catch (std::exception& e) {
-                // std::cerr << format("Task #%d failed with exception: %s\n", (int)(itr - futures.begin()), e.what());
-            }
+            std::move(fut).get();
         }
     
-        if (__builtin_expect(finished_count != simulate_times, 0)) {  // unlikely
-            // std::cerr << "Warning: Finished cout is actually " << finished_count << ", expected is" << simulate_times << std::endl;
-        }
-        hp_list.print_list();
         size_t total_rlist_size = 0;
         auto& rl_data = retire_lists.GetLists();
         for (auto itr = rl_data.begin(); itr != rl_data.end(); ++itr) {
@@ -749,7 +760,7 @@ public:
         return engine;
     }
     
-    void Ruleout(HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, MTRetireLists<std::vector<uint64_t>>& retire_lists) {
+    void Rollout(HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, MTRetireLists<std::vector<uint64_t>>& retire_lists) {
         std::vector<std::vector<uint64_t>*> retire_list;
         retire_lists.InheritThreadLocalRetireList(retire_list);
         auto& engine = get_threadlocal_generator();
@@ -774,7 +785,7 @@ public:
         node->UpdateRecursively(score);  // step 4: backpropagate
         int count = finished_count.fetch_add(1) + 1;
         if (__builtin_expect((count % 100000) == 0, 0)) {  // unlikely
-            std::cout << format("Ruleout count: %d\n", count); 
+            std::cout << format("Rollout count: %d\n", count); 
         }
         retire_lists.UpdateThreadLocalRetireList(std::move(retire_list));
     }
@@ -790,4 +801,4 @@ private:
 
 }  // namespace gomoku_ai
 
-#endif  // GOMOKU_AI_HPP_
+#endif  // ALPHAZERO_MCTS_HPP_

@@ -4,3 +4,4 @@ build
 *.swp
 core
 web_server
+__pycache__
