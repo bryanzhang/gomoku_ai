@@ -4,6 +4,10 @@ from policy_value_net_pytorch import PolicyValueNet
 import random
 from game import Game
 from player import PureMCTSPlayer, AlphaZeroPlayer
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import sys
+import time
 
 class TrainPipeline():
     def __init__(self, init_model=None):
@@ -15,12 +19,16 @@ class TrainPipeline():
         self.batch_size = 512
         self.check_freq = 50
         self.pure_mcts_playout_num = 1500000
-        self.n_playout = 200000
+        self.n_playout = 50000
         self.kl_targ = 0.02
         self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model)
         self.game = Game()
         self.tmp_model_path = "/tmp/gomoku_model.pt"
-        self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path)
+        self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 1, 5.0, True)
+        self.data_buffer = []
+        self.epochs = 5 # num of train_steps for each update
+        self.learn_rate = 2e-3
+        self.lr_multiplier = 1.0 # adaptively adjust the learning rate based on KL
 
     def get_augumented_data(self, play_data):
         # 旋转和翻转得到更多样本,共产生8倍样本
@@ -61,10 +69,11 @@ class TrainPipeline():
                    winner = 1 - winner
             win_cnt[winner] += 1
         win_ratio = (2.0*win_cnt[0] + win_cnt[-1]) / (2.0*n_games) # 按得分率算胜率(胜利得2分,平局得1分)
-        print(f"num_playouts:{self.pure_mcts_playout_num}, win: {win_cnt[0]}, lose: {win_cnt[1]}, draw: {win_cnt[-1]}")
+        print(f"num_playouts:{self.pure_mcts_playout_num}, win: {win_cnt[0]}, lose: {win_cnt[1]}, draw: {win_cnt[-1]}", file=sys.stderr)
         return win_ratio
 
     def policy_value_update(self):
+        start_time = time.time()
         mini_batch = random.sample(self.data_buffer, self.batch_size)
         state_batch = [data[0] for data in mini_batch]
         mcts_probs_batch = [data[1] for data in mini_batch]
@@ -72,7 +81,7 @@ class TrainPipeline():
         old_probs, old_v = self.policy_value_net.policy_value(state_batch)
         # PPO
         for i in range(self.epochs):
-            loss, entropy = self.policy_value_net.train_step(state_batch, mcts_probs, batch, winner_batch, self.learn_rate*self.lr_multiplier)
+            loss, entropy = self.policy_value_net.train_step(state_batch, mcts_probs_batch, winner_batch, self.learn_rate*self.lr_multiplier)
             new_probs, new_v = self.policy_value_net.policy_value(state_batch)
             kl = np.mean(np.sum(old_probs * (np.log(old_probs + 1e-10) - np.log(new_probs + 1e-10)), axis=1))
             if kl > self.kl_targ * 4:  # early stopping if D_KL diverges badly
@@ -85,26 +94,33 @@ class TrainPipeline():
 
         explained_var_old = (1 - np.var(np.array(winner_batch) - old_v.flatten()) / np.var(np.array(winner_batch)))
         explained_var_new = (1 - np.var(np.array(winner_batch) - new_v.flatten()) / np.var(np.array(winner_batch)))
-        print(f"KL:{kl:.5f}, lr_+multiplier: {self.lr_multiplier:.3f}, loss:{loss}, entropy:{entropy}, explained_var_old: {explained_var_old:.3f}, explained_var_new: {explained_var_new:.3f}")
+        execution_time = time.time() - start_time
+        print(f"KL:{kl:.5f}, lr_+multiplier: {self.lr_multiplier:.3f}, loss:{loss}, entropy:{entropy}, explained_var_old: {explained_var_old:.3f}, explained_var_new: {explained_var_new:.3f}, learn time: {execution_time:.3f} seconds", file=sys.stderr)
         return loss, entropy
 
     def run(self):
+        writer = SummaryWriter("./gomoku_experiments")
         for i in range(self.game_batch_num):
             self.collect_selfplay_data(self.play_batch_size)
-            print(f"Batch i:#{i+1}, episolde_len:{self.episode_len}")
+            print(f"Batch i:#{i+1}, episolde_len:{self.episode_len}", file=sys.stderr)
             if len(self.data_buffer) > self.batch_size:
                 loss, entropy = self.policy_value_update()
-            if (i + 1) % self.check_freq == 0:
-                print(f"Current self-play batch: {i+1}")
+                writer.add_scalar('Loss/Train', loss, i)
+                writer.add_scalar('Entropy/Train', entropy, i)
+            if (i + 1) % self.check_freq == 1000000000:
+            #if (i + 1) % self.check_freq == 0:
+                print(f"Current self-play batch: {i+1}", file=sys.stderr)
                 win_ratio = self.policy_evaluate()
+                writer.add_scalar('WinRatio', win_ratio, i)
                 self.policy_value_net.save_model('./current_policy.model')
                 if win_ratio > self.best_win_ratio:
-                    print("New best policy!!!")
+                    print("New best policy!!!", file=sys.stderr)
                     self.best_win_ratio = win_ratio
                     self.policy_value_net.save_model('./best_policy.model')
                 if win_ratio == 1.0:
-                    print(f"Early stop!The hybrid model now can surely beat pure MCTS!")
+                    print(f"Early stop!The hybrid model now can surely beat pure MCTS!", file=sys.stderr)
                     break
+        writer.close()
 
 if __name__ == '__main__':
     training_pipeline = TrainPipeline()

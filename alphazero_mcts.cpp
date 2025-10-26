@@ -1,4 +1,5 @@
 #include "alphazero_mcts.hpp"
+#include <pybind11/functional.h>
 
 PYBIND11_MODULE(gomoku_ai, m) {
     m.doc() = "Pybind11 pure MCTS gomoku plugin";
@@ -113,7 +114,7 @@ PYBIND11_MODULE(gomoku_ai, m) {
             "Make a move.\n")
         .def("AvailableCount", &gomoku_ai::GomokuMCTSFramework<8, true>::AvailableCount, "How many grids there are to put pieces\n")
         .def("IsEnd", &gomoku_ai::GomokuMCTSFramework<8, true>::IsEnd, "Is the game over(win,lose or draw)\n")
-        .def("SearchBestMove", &gomoku_ai::GomokuMCTSFramework<8, true>::SearchBestMoveWithModel<>, py::arg("simulate_times"), py::arg("model_path"), py::arg("temperature"), py::arg("sensible_moves"), py::arg("sensible_probs"), "Monto-Carlo tree search for specified times to search the best move.\n");
+        .def("SearchBestMove", &gomoku_ai::GomokuMCTSFramework<8, true>::SearchBestMoveWithModel<>, py::arg("simulate_times"), py::arg("model_path"), py::arg("temperature"), "Monto-Carlo tree search for specified times to search the best move.\n");
 
     py::class_<gomoku_ai::GomokuMCTSFramework<11, true>>(m, "AlphaZeroMCTSFramework11")
         .def(py::init<int, float, bool>(),
@@ -135,5 +136,5 @@ PYBIND11_MODULE(gomoku_ai, m) {
             "Make a move.\n")
         .def("AvailableCount", &gomoku_ai::GomokuMCTSFramework<11, true>::AvailableCount, "How many grids there are to put pieces\n")
         .def("IsEnd", &gomoku_ai::GomokuMCTSFramework<11, true>::IsEnd, "Is the game over(win,lose or draw)\n")
-        .def("SearchBestMove", &gomoku_ai::GomokuMCTSFramework<11, true>::SearchBestMoveWithModel<>, py::arg("simulate_times"), py::arg("model_path"), py::arg("temperature"), py::arg("sensible_moves"), py::arg("sensible_probs"), "Monto-Carlo tree search for specified times to search the best move.\n");
+        .def("SearchBestMove", &gomoku_ai::GomokuMCTSFramework<11, true>::SearchBestMoveWithModel<>, py::arg("simulate_times"), py::arg("model_path"), py::arg("temperature"), "Monto-Carlo tree search for specified times to search the best move.\n");
 }

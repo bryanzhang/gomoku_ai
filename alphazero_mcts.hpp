@@ -283,7 +283,7 @@ public:
         }
 
         torch::jit::script::Module module = torch::jit::load(model_path_);
-        std::cerr << format("Thread #{} Model load successfully!\n", this_id);
+        // std::cerr << format("Thread #%llu Model load successfully!\n", *(uint64_t*)&this_id);
         std::unique_lock wlock(mutex_);
         models_[this_id] = std::move(module);
         return models_[this_id];
@@ -320,7 +320,7 @@ struct TreeNode {
     }
 
     template <bool T = WITH_PRIOR_P, typename std::enable_if_t<!T, bool> = true>
-    TreeNode(TreeNode* parent, int move_index, bool is_last_black, float p = 1.0) : parent_(parent), availables_(parent->availables_), blacks_(parent->blacks_) {
+    TreeNode(TreeNode* parent, int move_index, bool is_last_black) : parent_(parent), availables_(parent->availables_), blacks_(parent->blacks_) {
         availables_.set(move_index, false);
         blacks_.set(move_index, is_last_black);
         children_ = (uint64_t)new std::vector<uint64_t>();
@@ -421,17 +421,17 @@ struct TreeNode {
         // 通道2: 对手玩家的棋子位置
         // 通道3: 上一步落子位置
         // 通道4: 下一步谁下(黑棋为1.0)
-        auto accessor = input_tensor.accessor<float, 3>();
+        auto accessor = input_tensor.accessor<float, 4>();
         if (!is_last_black) {  // 下一步玩家为黑棋
             for (int x = 0; x < BOARD_SIZE; ++x) {
                 for (int y = 0; y <BOARD_SIZE; ++y) {
                     int idx = y * BOARD_SIZE + x;
                     if (blacks_[idx]) {
-                        accessor[0][y][x] = 1.0;
+                        accessor[0][0][y][x] = 1.0;
                     } else if (!availables_[idx]) {
-                        accessor[1][y][x] = 1.0;
+                        accessor[0][1][y][x] = 1.0;
                     } else {
-                        accessor[3][y][x] = 1.0;
+                        accessor[0][3][y][x] = 1.0;
                     }
                 }
             }
@@ -440,15 +440,15 @@ struct TreeNode {
                 for (int y = 0; y < BOARD_SIZE; ++y) {
                     int idx = y * BOARD_SIZE+x;
                     if (blacks_[idx]) {
-                        accessor[1][y][x] = 1.0;
+                        accessor[0][1][y][x] = 1.0;
                     } else if (!availables_[idx]) {
-                        accessor[0][y][x] = 1.0;
+                        accessor[0][0][y][x] = 1.0;
                     }
                 }
             }
         }
         if (last_move.first >= 0 && last_move.second >= 0) {
-            accessor[2][last_move.second][last_move.first] = 1.0;
+            accessor[0][2][last_move.second][last_move.first] = 1.0;
         }
     }
 
@@ -461,8 +461,14 @@ struct TreeNode {
             if (!availables_[child_idx]) {
                 continue;
             }
-            auto* entry = new TreeNode<BOARD_SIZE, WITH_PRIOR_P>(this, child_idx, is_black, itr->second);
+            TreeNode<BOARD_SIZE, WITH_PRIOR_P> * entry;
+            if constexpr (WITH_PRIOR_P) {
+                entry = new TreeNode<BOARD_SIZE, WITH_PRIOR_P>(this, child_idx, is_black, itr->second);
+            } else {
+                entry = new TreeNode<BOARD_SIZE, WITH_PRIOR_P>(this, child_idx, is_black);
+            }
             entry->MakeVisible();
+            // std::cerr << "CHILD_IDX: " << itr->first << ", ENTRY: " << entry << ", Prior P=" << itr->second << std::endl;
             auto elem = ((uint64_t)entry | ((uint64_t)child_idx << 56));
             children->insert(children->end(), elem);
         }
@@ -486,6 +492,7 @@ struct TreeNode {
         } while (children_.load() != children_with_count);
 
         for (int i = 0; i < BOARD_SIZE* BOARD_SIZE; ++i) {
+            // std::cerr << "BITCOUNT: " << availables_.count() << std::endl;
             if (!availables_[i]) {
                 continue;
             }
@@ -494,11 +501,7 @@ struct TreeNode {
             float q = 0;
 
             float puct;
-            if constexpr (WITH_PRIOR_P) {
-                puct = c_puct * p_ * sqrt(visits);
-            } else {
                 puct = c_puct * sqrt(visits);
-            }
 
             float virtual_loss = 0.0;
 
@@ -507,10 +510,14 @@ struct TreeNode {
                 uint64_t state = child->concurrency_visits_score_;
                 uint8_t child_concurrency = (uint8_t)(state >> 56);
                 uint32_t child_visits = ((uint32_t)(state >> 32) & 0x00ffffffu);
+                // std::cerr << format("P_: %.2f\n", child->p_);
                 if constexpr (WITH_PRIOR_P) {
+                    puct *= child->p_;
                     uint32_t child_score;
                     std::memcpy(&child_score, &state, sizeof(child_score));
-                    q = (float)child_score / child_visits;
+                    if (child_visits != 0) {
+                        q = (float)child_score / child_visits;
+                    }
                 } else {
                     int32_t child_score = (int32_t)(state & 0xffffffffuLL);
                     q = (float)child_score / child_visits;
@@ -523,6 +530,7 @@ struct TreeNode {
                 }
             }
             auto adjust_q = q + puct + virtual_loss;
+            // std::cerr << format("ADJUST_Q: %.2f\n", adjust_q);
             if (adjust_q > max_q) {
                 candidates.clear();
                 max_q = adjust_q;
@@ -533,6 +541,7 @@ struct TreeNode {
         }
 
         p_rec->Release();
+        // std::cerr << format("Candidates size: %llu\n", candidates.size());
         std::uniform_int_distribution<int> distribution(0, (int)candidates.size() - 1);
         int child_idx = candidates[distribution(engine)];
         // std::cerr << format("Task#%d Selected child index: %d\n", task_idx, child_idx);
@@ -706,12 +715,13 @@ public:
     }
 
     ~GomokuMCTSFramework() {
-        std::cerr << "Reclaim root...\n";
+        // std::cerr << "Reclaim root...\n";
         delete root_;
     }
 
     bool StateEquals(std::vector<std::vector<int>>& board, bool is_last_black) const {
         if (is_last_black != is_last_black_) {
+std::cerr << "Last black not equal!" << std::endl;
             return false;
         }
 
@@ -734,11 +744,14 @@ public:
                }
            }
         }
+std::cerr << "Availables Equals: " << availables == root_->availables_ << std::endl;
+std::cerr << "Blacks Equals: " << blacks == root_->blacks_ << std::endl;
         return (availables == root_->availables_ && blacks == root_->blacks_); 
     }
 
     bool NpStateEquals(py::array_t<int32_t> np_board, bool is_last_black) const {
         if (is_last_black != is_last_black_) {
+std::cerr << "Last black not equal!" << std::endl;
             return false;
         }
 
@@ -764,6 +777,9 @@ public:
                }
            }
         }
+std::cerr << "Availables Equals: " << (availables == root_->availables_) << std::endl;
+std::cerr << "Available count: " << availables.count() << ", " << root_->availables_.count() << std::endl;
+std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
         return (availables == root_->availables_ && blacks == root_->blacks_); 
     }
 
@@ -817,9 +833,12 @@ public:
 
     // 返回所有可落子位置及对应概率值
     template <bool W = WITH_MODEL>
-    std::enable_if_t<W, void> SearchBestMoveWithModel(int simulate_times, const char* model_path, float temperature, std::vector<int>& sensible_moves, std::vector<double>& sensible_probs) {
+    std::enable_if_t<W, std::pair<std::vector<int>, std::vector<double>>> SearchBestMoveWithModel(int simulate_times, const char* model_path, float temperature) {
+        std::vector<int> sensible_moves;
+        std::vector<double> sensible_probs;
+        // std::cerr << "Judging isend...\n";
         if (root_->IsEnd(last_move_, is_last_black_)) {
-            return;
+            return { sensible_moves, sensible_probs };
         }
 
         std::atomic<int> finished_count = 0;
@@ -833,8 +852,10 @@ public:
             folly::Future<folly::Unit> fut = folly::via(&executor_, [this, &hp_list, &models, &finished_count, i, &retire_lists]() { this->RolloutWithModel(models, hp_list, finished_count, i, retire_lists); });
             futures.emplace_back(std::move(fut));
         }
+        // std::cerr << format("All submitted!\n");
         for (auto itr = futures.begin(); itr != futures.end(); ++itr) {
             auto& fut = *itr;
+            // std::cerr << format("Getting task #{}", itr - futures.begin());
             std::move(fut).get();
         }
 
@@ -847,8 +868,12 @@ public:
         std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
 
         std::vector<uint64_t>* root_children = (std::vector<uint64_t>*)(root_->children_ & 0x0000ffffffffffffuLL);
+        std::cerr << "Root children size: " << root_children->size() << std::endl;
         for (auto itr = root_children->begin(); itr != root_children->end(); ++itr) {
             auto idx = (int)(*itr >> 56);
+            if (!root_->availables_[idx]) {
+                continue;
+            }
             auto* child = (TreeNode<BOARD_SIZE, WITH_MODEL>*)(*itr & 0x00ffffffffffffff);
             uint64_t concurrency_visits_score = child->concurrency_visits_score_;
             uint32_t child_visits = ((uint32_t)(concurrency_visits_score >> 32) & 0xffffffu);
@@ -856,6 +881,9 @@ public:
             sensible_moves.push_back(idx);
         }
         softmax_inplace(sensible_probs);
+        std::cerr << "Moves size: " << sensible_moves.size() << std::endl;
+        std::cerr << "Probs size: " << sensible_probs.size() << std::endl;
+        return { sensible_moves, sensible_probs };
     }
 
     template <bool W = WITH_MODEL>
@@ -886,7 +914,7 @@ public:
             total_rlist_size += itr->second.size();
             hp_list.TryReclaim(itr->second);
         }
-        std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
+        // std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
  
         // find the most visited.
         std::vector<Move> best_actions;
@@ -961,13 +989,14 @@ public:
         node->UpdateRecursively(score);  // step 4: backpropagate
         int count = finished_count.fetch_add(1) + 1;
         if (__builtin_expect((count % 100000) == 0, 0)) {  // unlikely
-            std::cout << format("Rollout count: %d\n", count); 
+            std::cerr << format("Rollout count: %d\n", count); 
         }
         retire_lists.UpdateThreadLocalRetireList(std::move(retire_list));
     }
 
     template <bool T = WITH_MODEL, typename std::enable_if_t<T, bool> = true>
     void RolloutWithModel(ThreadLocalModels& models, HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, MTRetireLists<std::vector<uint64_t>>& retire_lists) {
+        // std::cerr << "RolloutWithModel\n";
         std::vector<std::vector<uint64_t>*> retire_list;
         retire_lists.InheritThreadLocalRetireList(retire_list);
         auto& engine = get_threadlocal_generator();
@@ -976,10 +1005,16 @@ public:
         Move last_move = last_move_;
         bool is_last_black = is_last_black_;
         node->WeakLock();
-        while (node->children_.load() != 0uLL) {
+        for (; ;) {
+            auto* children = (std::vector<uint64_t>*)(node->children_.load() & 0x0000ffffffffffff);
+            if (children == nullptr || children->empty()) {
+                break;
+            }
+            // std::cerr << "SelectAndExpand\n";
             auto elem = node->SelectAndExpand(task_idx, hp_list, retire_list, engine, c_puct_, !is_last_black);
             auto idx = (int)(elem >> 56);
             last_move = { (idx % BOARD_SIZE), (idx / BOARD_SIZE) };
+            // std::cerr << format("IDX: %d, %d\n", (idx % BOARD_SIZE), (idx / BOARD_SIZE));
             is_last_black = !is_last_black;
             node = (TreeNode<BOARD_SIZE, WITH_MODEL>*)(elem & 0x00ffffffffffffffuLL);
             node->WeakLock();
@@ -989,30 +1024,41 @@ public:
         std::map<int, float> act_probs;
         float score = 1.0;
         if (!node->IsEnd(last_move, is_last_black)) {
+            // std::cerr << "NOT IsEnd!\n";
             torch::Tensor input_tensor = torch::zeros({1, 4, BOARD_SIZE, BOARD_SIZE});
+            // std::cerr << "Preparing 1\n";
             node->GenModelInputTensor(input_tensor, last_move, is_last_black);
+            // std::cerr << "Preparing 2\n";
             std::vector<torch::jit::IValue> inputs;
+            // std::cerr << "Preparing 3\n";
             inputs.push_back(input_tensor);
+            // std::cerr << "Infering ...\n";
             auto output_tuple = model.forward(inputs).toTuple();
+            // std::cerr << "Getting output 1\n";
             auto policy_output = output_tuple->elements()[0].toTensor().accessor<float, 2>();
             // TODO(junhaozhang): mask invalid positions.
-            score = output_tuple->elements()[1].toTensor().accessor<float, 1>()[0];
+            // std::cerr << "Getting output 2\n";
+            score = output_tuple->elements()[1].toTensor().accessor<float, 2>()[0][0];
             for (int x = 0; x < BOARD_SIZE; ++x) {
                 for (int y = 0; y <BOARD_SIZE; ++y) {
-                    act_probs[y * BOARD_SIZE + x] = policy_output[x][y];
+                    act_probs[y * BOARD_SIZE + x] = std::exp(policy_output[0][y * BOARD_SIZE + x]);
                 }
             }
+            // std::cerr << "Expanding...\n";
             node->Expand(act_probs, !is_last_black);
         } else {
+            // std::cerr << "IsEnd!\n";
             if (node->availables_.count() == 0) {
                 score = 0.0;
             }
         }
+        // std::cerr << format("UpdateARecursively:%.2f\n", score);
         node->UpdateRecursively(score);
         int count = finished_count.fetch_add(1) + 1;
         if (__builtin_expect((count % 100000) == 0, 0)) {  // unlikely
             std::cout << format("Rollout count: %d\n", count); 
         }
+        // std::cerr << "UpdateThreadLocalRetireList!\n";
         retire_lists.UpdateThreadLocalRetireList(std::move(retire_list));
     }
 

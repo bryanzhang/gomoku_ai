@@ -1,5 +1,6 @@
 #! /usr/bin/python3
 
+import sys
 import numpy as np
 
 class Game:
@@ -29,10 +30,15 @@ class Game:
         states, mcts_probs, current_players = [], [], [] 
         last_move = (-1, -1)
         current_player = 0
+        steps = 0
         while True:
             states.append(self.__get_board_input_tensor(last_move, current_player))
-            move, move_probs = player.get_action(self.board, last_move, temperature, True)
+            print(f"Geting action, last_move={last_move}", file=sys.stderr)
+            move, move_probs = player.get_action(self.board, last_move, temperature, True, True)
+            print(f"Playing postion {move}", file=sys.stderr)
             player.play(move)
+            self.board[move[0]][move[1]] = 2 * (1 - current_player) - 1
+            print(f"Board:\n{self.board}", file=sys.stderr)
             last_move = move
             mcts_probs.append(move_probs)
             current_players.append(current_player)
@@ -44,6 +50,8 @@ class Game:
                 if winner != -1:
                     winners_z[np.array(current_players) == winner] = 1.0
                     winners_z[np.array(current_players) != winner] = -1.0
+                print(f"Steps: {steps}", file=sys.stderr)
+                self.board = np.zeros((11, 11), dtype=np.int32)
                 player.reset()
                 return winner, zip(states, mcts_probs, winners_z)
             current_player = 1 - current_player

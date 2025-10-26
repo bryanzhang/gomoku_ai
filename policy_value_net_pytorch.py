@@ -72,7 +72,7 @@ class PolicyValueNet():
         set_learning_rate(self.optimizer, lr)
 
         # forward
-        log_act_probs, alue = self.policy_value_net(state_batch)
+        log_act_probs, value = self.policy_value_net(state_batch)
         # define the loss = (z - v)^2 - pi^T * log(p) + c||theta||^2
         # NOTE(junhaozhang): the L2 penalty is incorporated in optimizer
         value_loss = F.mse_loss(value.view(-1), winner_batch)
