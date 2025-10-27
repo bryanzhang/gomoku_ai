@@ -500,9 +500,7 @@ struct TreeNode {
             auto itr = find_by_key(*children, (uint8_t)i);
             float q = 0;
 
-            float puct;
-                puct = c_puct * sqrt(visits);
-
+            float puct = c_puct * sqrt(visits);
             float virtual_loss = 0.0;
 
             if (itr != children->end()) {
@@ -513,10 +511,10 @@ struct TreeNode {
                 // std::cerr << format("P_: %.2f\n", child->p_);
                 if constexpr (WITH_PRIOR_P) {
                     puct *= child->p_;
-                    uint32_t child_score;
+                    float child_score;
                     std::memcpy(&child_score, &state, sizeof(child_score));
                     if (child_visits != 0) {
-                        q = (float)child_score / child_visits;
+                        q = child_score / child_visits;
                     }
                 } else {
                     int32_t child_score = (int32_t)(state & 0xffffffffuLL);
@@ -878,6 +876,7 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
             uint64_t concurrency_visits_score = child->concurrency_visits_score_;
             uint32_t child_visits = ((uint32_t)(concurrency_visits_score >> 32) & 0xffffffu);
             sensible_probs.push_back(1.0 / temperature * std::log(child_visits + 1.0e-10));
+            // std::cerr << "Idx: " << idx << ", visits: " << child_visits << std::endl;
             sensible_moves.push_back(idx);
         }
         softmax_inplace(sensible_probs);
@@ -1036,7 +1035,6 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
             auto output_tuple = model.forward(inputs).toTuple();
             // std::cerr << "Getting output 1\n";
             auto policy_output = output_tuple->elements()[0].toTensor().accessor<float, 2>();
-            // TODO(junhaozhang): mask invalid positions.
             // std::cerr << "Getting output 2\n";
             score = output_tuple->elements()[1].toTensor().accessor<float, 2>()[0][0];
             for (int x = 0; x < BOARD_SIZE; ++x) {

@@ -8,6 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import sys
 import time
+from collections import deque
 
 class TrainPipeline():
     def __init__(self, init_model=None):
@@ -19,13 +20,13 @@ class TrainPipeline():
         self.batch_size = 512
         self.check_freq = 50
         self.pure_mcts_playout_num = 1500000
-        self.n_playout = 50000
+        self.n_playout = 10000
         self.kl_targ = 0.02
         self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model)
         self.game = Game()
         self.tmp_model_path = "/tmp/gomoku_model.pt"
         self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 1, 5.0, True)
-        self.data_buffer = []
+        self.data_buffer = deque(maxlen=10000)
         self.epochs = 5 # num of train_steps for each update
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0 # adaptively adjust the learning rate based on KL

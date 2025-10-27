@@ -50,7 +50,7 @@ class Game:
                 if winner != -1:
                     winners_z[np.array(current_players) == winner] = 1.0
                     winners_z[np.array(current_players) != winner] = -1.0
-                print(f"Steps: {steps}", file=sys.stderr)
+                print(f"Steps: {steps}, winner={winner}", file=sys.stderr)
                 self.board = np.zeros((11, 11), dtype=np.int32)
                 player.reset()
                 return winner, zip(states, mcts_probs, winners_z)
