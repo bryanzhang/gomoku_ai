@@ -454,7 +454,16 @@ struct TreeNode {
 
     template <bool T = WITH_PRIOR_P, typename std::enable_if_t<T, bool> = true>
     void Expand(const std::map<int, float>& act_probs, bool is_black) {
-        // TODO(junhaozhang): not support multithreading!
+        uint64_t old_children_with_count;
+        std::vector<uint64_t>* old_children;
+        do {
+            old_children_with_count = children_.load();
+            old_children = (std::vector<uint64_t>*)(old_children_with_count & 0x0000ffffffffffffuLL);
+            if (old_children != nullptr && !old_children->empty()) {
+                return;
+            }
+        } while (children_.load() != old_children_with_count);
+
         auto* children = new std::vector<uint64_t>();
         for (auto itr = act_probs.begin(); itr != act_probs.end(); ++itr) {
             int child_idx = itr->first;
@@ -472,7 +481,15 @@ struct TreeNode {
             auto elem = ((uint64_t)entry | ((uint64_t)child_idx << 56));
             children->insert(children->end(), elem);
         }
-        children_ = (uint64_t)children;
+        MakeChildrenVisible(*children);
+        uint64_t children_with_count = ( ((uint64_t)((uint16_t)(old_children_with_count >> 48) + 1) << 48) | (uint64_t)children );
+        if (!children_.compare_exchange_strong(old_children_with_count, children_with_count)) {
+            for (auto itr = children->begin(); itr != children->end(); ++itr) {
+                auto* entry = (TreeNode<BOARD_SIZE, WITH_PRIOR_P>*)(*itr & 0x00ffffffffffffffuLL);
+                delete entry;
+            }
+            delete children;
+        }
     }
 
     uint64_t SelectAndExpand(int task_idx, HPList<std::vector<uint64_t>>& hp_list, std::vector<std::vector<uint64_t>*>& retire_list, std::mt19937& engine, float c_puct, bool is_black) {
@@ -500,9 +517,7 @@ struct TreeNode {
             auto itr = find_by_key(*children, (uint8_t)i);
             float q = 0;
 
-            float puct;
-                puct = c_puct * sqrt(visits);
-
+            float puct = c_puct * sqrt(visits);
             float virtual_loss = 0.0;
 
             if (itr != children->end()) {
@@ -513,10 +528,10 @@ struct TreeNode {
                 // std::cerr << format("P_: %.2f\n", child->p_);
                 if constexpr (WITH_PRIOR_P) {
                     puct *= child->p_;
-                    uint32_t child_score;
+                    float child_score;
                     std::memcpy(&child_score, &state, sizeof(child_score));
                     if (child_visits != 0) {
-                        q = (float)child_score / child_visits;
+                        q = child_score / child_visits;
                     }
                 } else {
                     int32_t child_score = (int32_t)(state & 0xffffffffuLL);
@@ -878,6 +893,7 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
             uint64_t concurrency_visits_score = child->concurrency_visits_score_;
             uint32_t child_visits = ((uint32_t)(concurrency_visits_score >> 32) & 0xffffffu);
             sensible_probs.push_back(1.0 / temperature * std::log(child_visits + 1.0e-10));
+            // std::cerr << "Idx: " << idx << ", visits: " << child_visits << std::endl;
             sensible_moves.push_back(idx);
         }
         softmax_inplace(sensible_probs);
@@ -1036,7 +1052,6 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
             auto output_tuple = model.forward(inputs).toTuple();
             // std::cerr << "Getting output 1\n";
             auto policy_output = output_tuple->elements()[0].toTensor().accessor<float, 2>();
-            // TODO(junhaozhang): mask invalid positions.
             // std::cerr << "Getting output 2\n";
             score = output_tuple->elements()[1].toTensor().accessor<float, 2>()[0][0];
             for (int x = 0; x < BOARD_SIZE; ++x) {

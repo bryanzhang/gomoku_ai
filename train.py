@@ -8,6 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import sys
 import time
+from collections import deque
 
 class TrainPipeline():
     def __init__(self, init_model=None):
@@ -19,13 +20,13 @@ class TrainPipeline():
         self.batch_size = 512
         self.check_freq = 50
         self.pure_mcts_playout_num = 1500000
-        self.n_playout = 50000
+        self.n_playout = 10000
         self.kl_targ = 0.02
         self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model)
         self.game = Game()
         self.tmp_model_path = "/tmp/gomoku_model.pt"
         self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 1, 5.0, True)
-        self.data_buffer = []
+        self.data_buffer = deque(maxlen=10000)
         self.epochs = 5 # num of train_steps for each update
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0 # adaptively adjust the learning rate based on KL
@@ -72,7 +73,7 @@ class TrainPipeline():
         print(f"num_playouts:{self.pure_mcts_playout_num}, win: {win_cnt[0]}, lose: {win_cnt[1]}, draw: {win_cnt[-1]}", file=sys.stderr)
         return win_ratio
 
-    def policy_value_update(self):
+    def policy_value_update(self, seq_no):
         start_time = time.time()
         mini_batch = random.sample(self.data_buffer, self.batch_size)
         state_batch = [data[0] for data in mini_batch]
@@ -95,7 +96,7 @@ class TrainPipeline():
         explained_var_old = (1 - np.var(np.array(winner_batch) - old_v.flatten()) / np.var(np.array(winner_batch)))
         explained_var_new = (1 - np.var(np.array(winner_batch) - new_v.flatten()) / np.var(np.array(winner_batch)))
         execution_time = time.time() - start_time
-        print(f"KL:{kl:.5f}, lr_+multiplier: {self.lr_multiplier:.3f}, loss:{loss}, entropy:{entropy}, explained_var_old: {explained_var_old:.3f}, explained_var_new: {explained_var_new:.3f}, learn time: {execution_time:.3f} seconds", file=sys.stderr)
+        print(f"BatchNo.{seq_no+1}, KL:{kl:.5f}, lr_+multiplier: {self.lr_multiplier:.3f}, loss:{loss}, entropy:{entropy}, explained_var_old: {explained_var_old:.3f}, explained_var_new: {explained_var_new:.3f}, learn time: {execution_time:.3f} seconds", file=sys.stderr)
         return loss, entropy
 
     def run(self):
@@ -104,7 +105,7 @@ class TrainPipeline():
             self.collect_selfplay_data(self.play_batch_size)
             print(f"Batch i:#{i+1}, episolde_len:{self.episode_len}", file=sys.stderr)
             if len(self.data_buffer) > self.batch_size:
-                loss, entropy = self.policy_value_update()
+                loss, entropy = self.policy_value_update(i)
                 writer.add_scalar('Loss/Train', loss, i)
                 writer.add_scalar('Entropy/Train', entropy, i)
             if (i + 1) % self.check_freq == 1000000000:
