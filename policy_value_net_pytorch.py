@@ -1,5 +1,6 @@
 #! /usr/bin/python3
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -58,9 +59,21 @@ class PolicyValueNet():
         self.policy_value_net = Net(board_width, board_height)
         self.optimizer = optim.Adam(self.policy_value_net.parameters(), weight_decay=self.l2_const)
 
+        self.extra_state = {}
         if model_file:
-            net_params = torch.load(model_file)
-            self.policy_value_net.load_state_dict(net_params)
+            self.load_model(model_file)
+
+    # 既支持纯 state_dict, 也支持 save_checkpoint 产出的完整 checkpoint
+    def load_model(self, model_file):
+        ckpt = torch.load(model_file, map_location='cpu')
+        if isinstance(ckpt, dict) and 'net' in ckpt:
+            self.policy_value_net.load_state_dict(ckpt['net'])
+            if 'opt' in ckpt:
+                self.optimizer.load_state_dict(ckpt['opt'])
+            self.extra_state = {k: v for k, v in ckpt.items() if k not in ('net', 'opt')}
+        else:
+            self.policy_value_net.load_state_dict(ckpt)
+            self.extra_state = {}
 
     def train_step(self, state_batch, mcts_probs, winner_batch, lr):
         state_batch = Variable(torch.FloatTensor(state_batch))
@@ -93,6 +106,18 @@ class PolicyValueNet():
         traced_script_module = torch.jit.trace(self.policy_value_net, example_input)
         traced_script_module.save(model_file)
 
+    def get_policy_param(self):
+        return self.policy_value_net.state_dict()
+
     def save_model(self, model_file):
         net_params = self.get_policy_param() # get model params
-        torch.save(net_params.model_file)
+        torch.save(net_params, model_file)
+
+    # 完整 checkpoint: 网络权重 + optimizer 状态 + 训练进度, 用于续训
+    def save_checkpoint(self, ckpt_file, **extra):
+        ckpt = {'net': self.policy_value_net.state_dict(),
+                'opt': self.optimizer.state_dict()}
+        ckpt.update(extra)
+        tmp_file = ckpt_file + '.tmp'
+        torch.save(ckpt, tmp_file)
+        os.replace(tmp_file, ckpt_file)  # 原子替换, 避免写一半被中断导致 checkpoint 损坏

@@ -8,44 +8,57 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import sys
 import time
-from collections import deque
+from collections import deque, defaultdict
 
 class TrainPipeline():
     def __init__(self, init_model=None):
         self.board_width = 11
         self.board_height = 11
         self.n_in_row = 5
-        self.game_batch_num = 1500
+        self.game_batch_num = 500
         self.play_batch_size = 1
         self.batch_size = 512
-        self.check_freq = 50
+        self.check_freq = 1
+        self.save_freq = 10  # 每多少个 batch 落盘一次 checkpoint
         self.pure_mcts_playout_num = 1500000
-        self.n_playout = 10000
+        self.n_playout = 1000
         self.kl_targ = 0.02
         self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model)
         self.game = Game()
         self.tmp_model_path = "/tmp/gomoku_model.pt"
-        self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 1, 5.0, True)
+        self.ckpt_path = "./current_policy.ckpt"
+        self.best_win_ratio = -1.0
+        self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 16, 5.0, True)
         self.data_buffer = deque(maxlen=10000)
         self.epochs = 5 # num of train_steps for each update
         self.learn_rate = 2e-3
         self.lr_multiplier = 1.0 # adaptively adjust the learning rate based on KL
+        self.start_batch = 0
+        # 从 checkpoint 恢复训练进度
+        extra = self.policy_value_net.extra_state
+        if extra:
+            self.start_batch = extra.get('batch', 0)
+            self.lr_multiplier = extra.get('lr_multiplier', 1.0)
+            self.best_win_ratio = extra.get('best_win_ratio', 0.0)
+            print(f"Resumed from batch {self.start_batch}, lr_multiplier={self.lr_multiplier:.3f}", file=sys.stderr)
 
     def get_augumented_data(self, play_data):
         # 旋转和翻转得到更多样本,共产生8倍样本
         # TODO(junhaozhang): 可以有一半的样本再黑白棋反转，额外产生4倍样本
+        # NOTE(junhaozhang): state 平面按 [y][x] 索引, mcts_prob 平铺下标 idx = y*W + x,
+        # 二者布局一致, 因此对状态和概率图施加完全相同的几何变换即可, 不需要额外的 flipud。
         extend_data = []
         for state, mcts_prob, winner in play_data:
             for i in [1, 2, 3, 4]:
                 # rotate counterclockwise
                 equi_state = np.array([np.rot90(s, i) for s in state])
-                equi_mcts_prob = np.rot90(np.flipud(mcts_prob.reshape(self.board_height, self.board_width)), i)
-                extend_data.append((equi_state, np.flipud(equi_mcts_prob).flatten(), winner))
+                equi_mcts_prob = np.rot90(mcts_prob.reshape(self.board_height, self.board_width), i)
+                extend_data.append((equi_state, equi_mcts_prob.flatten(), winner))
 
                 # flip horizontally
                 equi_state = np.array([np.fliplr(s) for s in equi_state])
                 equi_mcts_prob = np.fliplr(equi_mcts_prob)
-                extend_data.append((equi_state, np.flipud(equi_mcts_prob).flatten(), winner))
+                extend_data.append((equi_state, equi_mcts_prob.flatten(), winner))
         return extend_data
 
     def collect_selfplay_data(self, n_games = 1):
@@ -58,8 +71,9 @@ class TrainPipeline():
             self.data_buffer.extend(play_data)
 
     def policy_evaluate(self, n_games = 10):
-        current_player = AlphaZeroPlayer(self.policy_value_net.poplicy_value_fn, c_puct=self.c_puct, n_playout=self.n_playout)
-        pure_mcts_player = PureMCTSPlayer(c_puct = 5, n_playout=self.pure_mcts_playout_num)
+        self.policy_value_net.save_model_with_torchscript(self.tmp_model_path)
+        current_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 16, 5.0, True)
+        pure_mcts_player = PureMCTSPlayer(self.pure_mcts_playout_num, 20, 2.0, True)
         win_cnt = defaultdict(int)
         for i in range(n_games):
             if (i % 2) == 0:
@@ -99,30 +113,47 @@ class TrainPipeline():
         print(f"BatchNo.{seq_no+1}, KL:{kl:.5f}, lr_+multiplier: {self.lr_multiplier:.3f}, loss:{loss}, entropy:{entropy}, explained_var_old: {explained_var_old:.3f}, explained_var_new: {explained_var_new:.3f}, learn time: {execution_time:.3f} seconds", file=sys.stderr)
         return loss, entropy
 
+    def save_checkpoint(self, batch_no):
+        self.policy_value_net.save_checkpoint(self.ckpt_path,
+                                              batch=batch_no + 1,
+                                              lr_multiplier=self.lr_multiplier,
+                                              best_win_ratio=self.best_win_ratio)
+        self.policy_value_net.save_model('./current_policy.model')
+        print(f"Checkpoint saved at batch {batch_no + 1} -> {self.ckpt_path}", file=sys.stderr)
+
     def run(self):
         writer = SummaryWriter("./gomoku_experiments")
-        for i in range(self.game_batch_num):
-            self.collect_selfplay_data(self.play_batch_size)
-            print(f"Batch i:#{i+1}, episolde_len:{self.episode_len}", file=sys.stderr)
-            if len(self.data_buffer) > self.batch_size:
-                loss, entropy = self.policy_value_update(i)
-                writer.add_scalar('Loss/Train', loss, i)
-                writer.add_scalar('Entropy/Train', entropy, i)
-            if (i + 1) % self.check_freq == 1000000000:
-            #if (i + 1) % self.check_freq == 0:
-                print(f"Current self-play batch: {i+1}", file=sys.stderr)
-                win_ratio = self.policy_evaluate()
-                writer.add_scalar('WinRatio', win_ratio, i)
-                self.policy_value_net.save_model('./current_policy.model')
-                if win_ratio > self.best_win_ratio:
+        i = self.start_batch
+        try:
+            for i in range(self.start_batch, self.game_batch_num):
+                self.collect_selfplay_data(self.play_batch_size)
+                print(f"Batch i:#{i+1}, episolde_len:{self.episode_len}", file=sys.stderr)
+                if len(self.data_buffer) > self.batch_size:
+                    loss, entropy = self.policy_value_update(i)
+                    writer.add_scalar('Loss/Train', loss, i)
+                    writer.add_scalar('Entropy/Train', entropy, i)
+                if (i + 1) % self.save_freq == 0:
+                    self.save_checkpoint(i)
+                if (i + 1) % self.check_freq == 100000000:
+                    win_ratio = self.policy_evaluate()
+                    print(f"Current self-play batch: {i+1}, win_ratio={win_ratio}", file=sys.stderr)
+                    writer.add_scalar('WinRatio', win_ratio, i)
+                    if win_ratio == 1.0:
+                        print(f"Early stop!The hybrid model now can surely beat pure MCTS!", file=sys.stderr)
+                        break
+                    if win_ratio < self.best_win_ratio:
+                        print(f"Early stop!The model cannot improve!", file=sys.stderr)
+                        break
                     print("New best policy!!!", file=sys.stderr)
                     self.best_win_ratio = win_ratio
                     self.policy_value_net.save_model('./best_policy.model')
-                if win_ratio == 1.0:
-                    print(f"Early stop!The hybrid model now can surely beat pure MCTS!", file=sys.stderr)
-                    break
-        writer.close()
+        except KeyboardInterrupt:
+            print("\nInterrupted, saving checkpoint...", file=sys.stderr)
+        finally:
+            self.save_checkpoint(i)
+            writer.close()
 
 if __name__ == '__main__':
-    training_pipeline = TrainPipeline()
+    init_model = sys.argv[1] if len(sys.argv) > 1 else None
+    training_pipeline = TrainPipeline(init_model=init_model)
     training_pipeline.run()

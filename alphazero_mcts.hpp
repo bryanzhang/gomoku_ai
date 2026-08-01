@@ -430,9 +430,10 @@ struct TreeNode {
                         accessor[0][0][y][x] = 1.0;
                     } else if (!availables_[idx]) {
                         accessor[0][1][y][x] = 1.0;
-                    } else {
-                        accessor[0][3][y][x] = 1.0;
                     }
+                    // NOTE(junhaozhang): 通道4表示"下一步是否黑棋走", 必须整片填1.0,
+                    // 而不是只填空点, 否则与 Python 侧 game.py 的训练输入不一致。
+                    accessor[0][3][y][x] = 1.0;
                 }
             }
         } else {
@@ -636,6 +637,9 @@ struct TreeNode {
             float scores;
             std::memcpy(&scores, &old_value, sizeof(scores));
             scores += score;
+            // NOTE(junhaozhang): memcpy 只写低32位, 必须先清零高32位再 OR,
+            // 否则 new_value 的高位是未初始化数据/上一轮 CAS 的残留, 会污染 visits 与 concurrency。
+            new_value = 0;
             std::memcpy(&new_value, &scores, sizeof(scores));
             new_value |= ((uint64_t)concurrency << 56);
             new_value |= ((uint64_t)visits << 32);
@@ -759,14 +763,14 @@ std::cerr << "Last black not equal!" << std::endl;
                }
            }
         }
-std::cerr << "Availables Equals: " << availables == root_->availables_ << std::endl;
-std::cerr << "Blacks Equals: " << blacks == root_->blacks_ << std::endl;
+// std::cerr << "Availables Equals: " << availables == root_->availables_ << std::endl;
+// std::cerr << "Blacks Equals: " << blacks == root_->blacks_ << std::endl;
         return (availables == root_->availables_ && blacks == root_->blacks_); 
     }
 
     bool NpStateEquals(py::array_t<int32_t> np_board, bool is_last_black) const {
         if (is_last_black != is_last_black_) {
-std::cerr << "Last black not equal!" << std::endl;
+// std::cerr << "Last black not equal!" << std::endl;
             return false;
         }
 
@@ -792,9 +796,9 @@ std::cerr << "Last black not equal!" << std::endl;
                }
            }
         }
-std::cerr << "Availables Equals: " << (availables == root_->availables_) << std::endl;
-std::cerr << "Available count: " << availables.count() << ", " << root_->availables_.count() << std::endl;
-std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
+// std::cerr << "Availables Equals: " << (availables == root_->availables_) << std::endl;
+// std::cerr << "Available count: " << availables.count() << ", " << root_->availables_.count() << std::endl;
+// std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
         return (availables == root_->availables_ && blacks == root_->blacks_); 
     }
 
@@ -897,8 +901,8 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
             sensible_moves.push_back(idx);
         }
         softmax_inplace(sensible_probs);
-        std::cerr << "Moves size: " << sensible_moves.size() << std::endl;
-        std::cerr << "Probs size: " << sensible_probs.size() << std::endl;
+        // std::cerr << "Moves size: " << sensible_moves.size() << std::endl;
+        // std::cerr << "Probs size: " << sensible_probs.size() << std::endl;
         return { sensible_moves, sensible_probs };
     }
 
@@ -1038,6 +1042,9 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
 
         auto& model = models.GetThreadLocalModel();
         std::map<int, float> act_probs;
+        // NOTE(junhaozhang): 本仓库的约定是"节点存的分数 = 走进该节点的那一方的视角"
+        // (见 pure_mcts.hpp 终局记 +1, 且 SelectAndExpand 对子节点取 max)。
+        // 终局时走进 node 的一方获胜, 故 score = 1.0。
         float score = 1.0;
         if (!node->IsEnd(last_move, is_last_black)) {
             // std::cerr << "NOT IsEnd!\n";
@@ -1053,7 +1060,8 @@ std::cerr << "Blacks Equals: " << (blacks == root_->blacks_) << std::endl;
             // std::cerr << "Getting output 1\n";
             auto policy_output = output_tuple->elements()[0].toTensor().accessor<float, 2>();
             // std::cerr << "Getting output 2\n";
-            score = output_tuple->elements()[1].toTensor().accessor<float, 2>()[0][0];
+            // value head 输出的是"该状态待走方"的视角, 与本节点存分的视角相反, 必须取负。
+            score = -output_tuple->elements()[1].toTensor().accessor<float, 2>()[0][0];
             for (int x = 0; x < BOARD_SIZE; ++x) {
                 for (int y = 0; y <BOARD_SIZE; ++y) {
                     act_probs[y * BOARD_SIZE + x] = std::exp(policy_output[0][y * BOARD_SIZE + x]);
