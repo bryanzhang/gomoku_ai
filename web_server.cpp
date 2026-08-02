@@ -29,7 +29,7 @@ using Move = gomoku_ai::Move;
 constexpr int DEFAULT_PURE_MCTS_SIMULATE_TIMES = 1000000;
 constexpr int DEFAULT_ALPHAZERO_SIMULATE_TIMES = 1000;
 // temperature 越小越接近 argmax(visits), 对局(非自对弈)时取一个很小的值。
-constexpr float DEFAULT_ALPHAZERO_TEMPERATURE = 0.003f;
+constexpr float DEFAULT_ALPHAZERO_TEMPERATURE = 0.001f;
 constexpr float DEFAULT_PURE_MCTS_C_PUCT = 2.0f;
 constexpr float DEFAULT_ALPHAZERO_C_PUCT = 5.0f;
 

@@ -8,7 +8,10 @@ class Game:
         self.board = np.zeros((11, 11), dtype=np.int32)
 
     # 返回赢家和步数
+    # NOTE(junhaozhang): 开局必须清空棋盘, 否则连续多局评估时会带着上一局的残局开打。
+    # 两个 player 自身的搜索树需要调用方在每局前 reset()。
     def start_play(self, black_player, white_player):
+        self.board = np.zeros((11, 11), dtype=np.int32)
         players = [ black_player, white_player ]
         last_move = (-1, -1)
         current_player = 0 # 总是黑棋先下
@@ -16,7 +19,10 @@ class Game:
         while True:
             player_in_turn = players[current_player]
             move = player_in_turn.get_action(self.board, last_move, return_prob=False)
-            player_in_turn.play(move)
+            # NOTE(junhaozhang): 双方的搜索树都要落这一手, 否则对手下一次
+            # get_action 里的 StateEquals 会失配(它只认自己走过的那些子)。
+            for player in players:
+                player.play(move)
             last_move = move
             self.board[move[0]][move[1]] = 2 * (1 - current_player) - 1
             steps += 1
@@ -26,9 +32,12 @@ class Game:
                 return winner, steps
             current_player = 1 - current_player
 
-    # NOTE(junhaozhang): 自对弈必须用 temperature=1.0, 这样 MCTS 返回的是按访问次数
-    # 归一化的分布(而非 argmax), 才能给 policy head 提供有效的监督信号。
-    def start_self_play(self, player, temperature=1.0):
+    # NOTE(junhaozhang): 前 temp_moves 手用 temperature=1.0 按访问次数采样, 保证开局
+    # 多样性; 之后切到 τ→0 直接走最强手, 让胜负由棋力决定而不是由随机走子决定, 这样
+    # value 目标 z 才干净(AlphaGo Zero 在 19x19 上是前 30 手)。
+    # 注意: 无论哪个阶段, 存进训练数据的 mcts_probs 都是 MCTS 在 τ=1 下的访问次数
+    # 分布 —— 那才是 policy head 的监督信号, 换成 one-hot 会把策略头训崩。
+    def start_self_play(self, player, temperature=1.0, temp_moves=10):
         states, mcts_probs, current_players = [], [], [] 
         last_move = (-1, -1)
         current_player = 0
@@ -36,7 +45,8 @@ class Game:
         while True:
             states.append(self.__get_board_input_tensor(last_move, current_player))
 	    #print(f"Geting action, last_move={last_move}", file=sys.stderr)
-            move, move_probs = player.get_action(self.board, last_move, temperature, True, True)
+            temp = temperature if steps < temp_moves else 1e-3
+            move, move_probs = player.get_action(self.board, last_move, temp, True, True)
 	    #print(f"Playing postion {move}", file=sys.stderr)
             player.play(move)
             self.board[move[0]][move[1]] = 2 * (1 - current_player) - 1
