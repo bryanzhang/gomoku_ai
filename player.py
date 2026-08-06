@@ -18,19 +18,17 @@ class PureMCTSPlayer:
         y = last_move[1]
         if x < 0 or y < 0:
             is_last_black = False
-            last_piece = None
         else:
             is_last_black = (np_board[x][y] == 1)
-            last_piece = np_board[x][y]
-            np_board[x][y] = 0
 
+        # NOTE(junhaozhang): C++ 侧状态包含所有已落子(构造按含 last_move 的完整棋盘,
+        # Play 落每一手), 与 AlphaZeroPlayer 一致, 这里要拿完整棋盘做 StateEquals,
+        # 不能把 last_move 的子摘掉(摘掉既会失配, 也会腐蚀 Game 的 board 引用)。
         if not self.game:
-            if last_piece != None:
-                np_board[x][y] = last_piece
-            self.game = gomoku_ai.GomokuMCTSFramework11(self.cores, np_board, last_move, self.c_puct, self.reuse_states)
+            self.game = gomoku_ai.PureMCTSFramework11(self.cores, np_board, last_move, self.c_puct, self.reuse_states)
         elif not self.game.StateEquals(np_board, is_last_black):
             print(f'State not equal!', file=sys.stderr)
-            raise
+            raise RuntimeError('State not equal!')
 
         move = self.game.SearchBestMove(self.simulate_times)
         if return_prob:
