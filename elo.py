@@ -16,8 +16,8 @@ import tempfile
 import time
 
 # NOTE(junhaozhang): gomoku_ai.so 依赖 libtorch 动态库, 必须先 import torch
-# (policy_value_net_pytorch 会 import torch) 再 import player/game, 否则 .so 加载失败。
-from policy_value_net_pytorch import PolicyValueNet
+# (policy_value_net_pytorch_v2 会间接 import torch) 再 import player/game, 否则 .so 加载失败。
+from policy_value_net_pytorch_v2 import load_net_any_arch
 from game import Game
 from player import AlphaZeroPlayer, PureMCTSPlayer
 
@@ -38,12 +38,13 @@ class AlphaZeroPlayerWithTemp(AlphaZeroPlayer):
 
 
 # AlphaZero 的 C++ 侧只认 torchscript(.pt); .model(state_dict/checkpoint) 先导出成 .pt。
+# 权重结构(v1 3conv / v2 ResNet)由 load_net_any_arch 按内容自动识别, 新旧 .model 都能转。
 def prepare_model_path(model_path, tag):
     if model_path.endswith('.pt'):
         return model_path
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"player {tag}: model file not found: {model_path}")
-    net = PolicyValueNet(BOARD_W, BOARD_H, model_file=model_path)
+    net = load_net_any_arch(BOARD_W, BOARD_H, model_path)
     fd, ts_path = tempfile.mkstemp(prefix=f'elo_{tag}_', suffix='.pt')
     os.close(fd)
     net.save_model_with_torchscript(ts_path)

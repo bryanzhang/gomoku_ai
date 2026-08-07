@@ -1,6 +1,7 @@
 #! /usr/bin/python3
 
-from policy_value_net_pytorch import PolicyValueNet
+# 训练用 v2(ResNet) 网络; v1(3conv) 保留在 policy_value_net_pytorch.py 供旧权重加载
+from policy_value_net_pytorch_v2 import PolicyValueNetV2 as PolicyValueNet
 import random
 from game import Game
 from player import AlphaZeroPlayer
@@ -39,6 +40,8 @@ class TrainPipeline():
         self.elo = 0.0       # 相对 Elo, 以第一个 baseline 版本为 0 分锚点
         self.best_elo = 0.0
         self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 16, 5.0, True)
+        # v4 路线图第 2 步: buffer 10000 -> 50000。8 倍增广后每局 ~400 条, 10000 只装
+        # ~25 局, 网络一直在"最近 25 局"上原地踏步; 50000 约 125 局窗口(~250MB 内存)。
         self.data_buffer = deque(maxlen=10000)
         self.epochs = 5 # num of train_steps for each update
         self.learn_rate = 2e-3

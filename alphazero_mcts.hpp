@@ -13,6 +13,7 @@
 #include <vector>
 #include <random>
 #include <type_traits>
+#include <sys/stat.h>
 
 #include <torch/script.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
@@ -272,6 +273,28 @@ class ThreadLocalModels {
 public:
     ThreadLocalModels(const char* model_path) : model_path_(model_path) {}
 
+    // 跨"手"复用的全局模型缓存: 同一 model_path 且文件未变(mtime+size)时复用线程局部
+    // 模型; 文件变化(如自对弈每局重写 .pt)时整体重建。否则每手棋 16 个线程都要各
+    // torch::jit::load 一次(单份 load+首次前向 27~57ms, x16线程 x~50手 ≈ 22~45s/局)。
+    // NOTE(junhaozhang): registry 用泄漏式堆对象, 进程退出时不析构 torch 模块, 避免
+    // torch 运行时先析构导致的 exit crash; 中途替换发生在 torch 存活期, 安全。
+    static ThreadLocalModels& Get(const char* model_path) {
+        struct stat st;
+        uint64_t mtime_ns = 0, fsize = 0;
+        if (::stat(model_path, &st) == 0) {
+            mtime_ns = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+            fsize = (uint64_t)st.st_size;
+        }
+        std::lock_guard<std::mutex> g(RegistryMutex());
+        auto& entry = Registry()[model_path];
+        if (!entry.models || entry.mtime_ns != mtime_ns || entry.fsize != fsize) {
+            entry.models.reset(new ThreadLocalModels(model_path));
+            entry.mtime_ns = mtime_ns;
+            entry.fsize = fsize;
+        }
+        return *entry.models;
+    }
+
     torch::jit::script::Module& GetThreadLocalModel() {
         std::thread::id this_id = std::this_thread::get_id();
         {
@@ -290,6 +313,19 @@ public:
     }
 
 private:
+    struct Entry {
+        std::unique_ptr<ThreadLocalModels> models;
+        uint64_t mtime_ns = 0;
+        uint64_t fsize = 0;
+    };
+    static std::map<std::string, Entry>& Registry() {
+        static auto* registry = new std::map<std::string, Entry>();  // 故意泄漏, 见 Get 注释
+        return *registry;
+    }
+    static std::mutex& RegistryMutex() {
+        static auto* m = new std::mutex();
+        return *m;
+    }
     mutable std::shared_mutex mutex_;
     std::map<std::thread::id, torch::jit::script::Module>  models_;
     std::string model_path_;
@@ -864,7 +900,7 @@ std::cerr << "Last black not equal!" << std::endl;
         HPList<std::vector<uint64_t>> hp_list(100);
         MTRetireLists<std::vector<uint64_t>> retire_lists;
 
-        ThreadLocalModels models(model_path);
+        auto& models = ThreadLocalModels::Get(model_path);  // 跨手复用, 文件变化才 reload
         MakeAllVisible();
         std::vector<folly::Future<folly::Unit>> futures;
         for (int i = 0; i < simulate_times; ++i) {
