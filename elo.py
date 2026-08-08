@@ -15,6 +15,10 @@ import sys
 import tempfile
 import time
 
+# 必须在 import torch(由下面 policy_value_net_pytorch_v2 间接引入)之前设置:
+# 本机 NNPACK 初始化失败, c10 每次 conv 都打一条 WARNING 刷屏, 提到 ERROR 级屏蔽。
+os.environ.setdefault('TORCH_CPP_LOG_LEVEL', 'ERROR')
+
 # NOTE(junhaozhang): gomoku_ai.so 依赖 libtorch 动态库, 必须先 import torch
 # (policy_value_net_pytorch_v2 会间接 import torch) 再 import player/game, 否则 .so 加载失败。
 from policy_value_net_pytorch_v2 import load_net_any_arch

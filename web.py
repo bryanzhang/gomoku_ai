@@ -1,6 +1,10 @@
 #! /usr/bin/python3
 
 from datetime import datetime
+import os
+# 必须在 import torch/gomoku_ai 之前设置: 本机 NNPACK 初始化失败,
+# c10 每次 conv 都打一条 WARNING 刷屏, 提到 ERROR 级屏蔽。
+os.environ.setdefault('TORCH_CPP_LOG_LEVEL', 'ERROR')
 import gomoku_ai
 from flask import Flask, request, jsonify, render_template, session
 import torch

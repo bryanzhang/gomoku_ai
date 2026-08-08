@@ -1,6 +1,10 @@
 #! /usr/bin/python3
 
 # 训练用 v2(ResNet) 网络; v1(3conv) 保留在 policy_value_net_pytorch.py 供旧权重加载
+import os
+# 必须在 import torch(由 policy_value_net_pytorch_v2 间接引入)之前设置:
+# 本机 NNPACK 初始化失败, c10 每次 conv 都打一条 WARNING 刷屏, 提到 ERROR 级屏蔽。
+os.environ.setdefault('TORCH_CPP_LOG_LEVEL', 'ERROR')
 from policy_value_net_pytorch_v2 import PolicyValueNetV2 as PolicyValueNet
 import random
 from game import Game

@@ -12,6 +12,8 @@
 #include <mutex>
 #include <atomic>
 #include <utility>
+#include <filesystem>
+#include <unistd.h>
 #include <pybind11/embed.h>  // 需要包含这个头文件
 
 
@@ -311,9 +313,10 @@ void PrintUsage(const char* prog) {
         << "      --no-reuse-tree       不复用上一步的搜索树\n"
         << "  -h, --help                打印本帮助\n"
         << "\n"
-        << "NOTE: 模型必须是 TorchScript(torch.jit) 文件, 即\n"
-        << "      PolicyValueNet.save_model_with_torchscript() 的产物(如 /tmp/gomoku_model.pt),\n"
-        << "      不能直接用 current_policy.model / current_policy.ckpt 这类 state_dict。"
+        << "NOTE: 模型支持两种形式:\n"
+        << "      1) TorchScript(.pt), PolicyValueNet.save_model_with_torchscript() 的产物;\n"
+        << "      2) state_dict/checkpoint(.model/.ckpt, 如 current_policy.model),\n"
+        << "         启动时自动按内容识别 v1(3conv)/v2(ResNet) 结构并导出成 .pt 再加载。"
         << std::endl;
 }
 
@@ -393,6 +396,32 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
     return true;
 }
 
+// C++ 侧只认 TorchScript(.pt); .model/.ckpt(state_dict/checkpoint)先借助内嵌 Python
+// 解释器走 load_net_any_arch 自动识别 v1(3conv)/v2(ResNet, 推断 blocks/channels)结构
+// 并导出 .pt。与 elo.py 的 prepare_model_path 同一条路径, 行为保持一致。
+// 返回可用的 .pt 路径; 转换失败返回空串。
+std::string ExportToTorchScriptIfNeeded(const std::string& model_path) {
+    if (model_path.size() >= 3 && model_path.substr(model_path.size() - 3) == ".pt") {
+        return model_path;
+    }
+    std::cout << "Converting state_dict model to TorchScript: " << model_path << std::endl;
+    auto ts_path = (std::filesystem::temp_directory_path() /
+                    ("web_server_" + std::to_string(::getpid()) + ".pt")).string();
+    try {
+        py::gil_scoped_acquire gil;
+        py::module_ sys = py::module_::import("sys");
+        sys.attr("path").attr("insert")(0, ".");  // policy_value_net_pytorch_v2 与 web_server 同目录
+        py::module_ pv = py::module_::import("policy_value_net_pytorch_v2");
+        py::object net = pv.attr("load_net_any_arch")(BOARD_SIZE, BOARD_SIZE, model_path);
+        net.attr("save_model_with_torchscript")(ts_path);
+    } catch (const py::error_already_set& e) {
+        std::cerr << "Failed to convert model '" << model_path << "': " << e.what() << std::endl;
+        return "";
+    }
+    std::cout << "Exported TorchScript: " << ts_path << std::endl;
+    return ts_path;
+}
+
 // 提前加载一次模型, 把"模型路径写错/不是 TorchScript 文件"这类问题在启动时就暴露出来,
 // 而不是等到第一次落子搜索时才在工作线程里抛异常。
 bool CheckModel(const std::string& model_path) {
@@ -436,7 +465,8 @@ int main(int argc, char** argv) {
     }
 
     if (config.UseModel()) {
-        if (!CheckModel(config.model_path)) {
+        config.model_path = ExportToTorchScriptIfNeeded(config.model_path);
+        if (config.model_path.empty() || !CheckModel(config.model_path)) {
             return -1;
         }
         std::cout << "AI: AlphaZero(MCTS + policy-value net), model: " << config.model_path

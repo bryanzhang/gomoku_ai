@@ -938,10 +938,10 @@ std::cerr << "Last black not equal!" << std::endl;
             total_rlist_size += itr->second.size();
             hp_list.TryReclaim(itr->second);
         }
-        std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
+        // std::cerr << "Total retire list size: " << total_rlist_size << std::endl;
 
         std::vector<uint64_t>* root_children = (std::vector<uint64_t>*)(root_->children_ & 0x0000ffffffffffffuLL);
-        std::cerr << "Root children size: " << root_children->size() << std::endl;
+        // std::cerr << "Root children size: " << root_children->size() << std::endl;
         for (auto itr = root_children->begin(); itr != root_children->end(); ++itr) {
             auto idx = (int)(*itr >> 56);
             if (!root_->availables_[idx]) {
