@@ -16,6 +16,13 @@
 #include <sys/stat.h>
 
 #include <torch/script.h>
+#include <ATen/Parallel.h>
+
+// 不显式包含 omp.h 以避免引入 OpenMP 编译参数; libgomp 由 torch 带入进程,
+// 链接时加 -lgomp 即可解析(见 setup.py)。
+// 注意: 不要在这里加 mkl_set_num_threads_local —— 在从未初始化过 MKL TLS 的
+// worker 线程上首调它会段错误(实测); 若确有需要, 必须在首条 MKL 算子之后调。
+extern "C" void omp_set_num_threads(int);
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
 #include <folly/Unit.h>
@@ -1063,6 +1070,19 @@ std::cerr << "Last black not equal!" << std::endl;
 
     template <bool T = WITH_MODEL, typename std::enable_if_t<T, bool> = true>
     void RolloutWithModel(ThreadLocalModels& models, HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, MTRetireLists<std::vector<uint64_t>>& retire_lists) {
+        // NOTE(junhaozhang): 前向的 intra-op OMP 并行默认开满核数, 16 个 worker x 16 个
+        // OMP 线程在 16 核上互相抢占, 实测 1000 sims 从 ~250ms 劣化到 ~1300ms(5x+)。
+        // 小网络单次前向的算子同步开销远大于计算, 必须由 worker 级并行独占核。
+        // 两个开关都是 thread-local, 只影响本 worker, 不影响 Python 主线程训练的
+        // 批量算子: at::set_num_threads 管 ATen 自身并行; omp_set_num_threads 管
+        // THNN slow_conv2d 的 unfolded2d_copy_kernel 裸 OMP region(gdb 实测 conv
+        // 走的是这条路而非 oneDNN, 该 kernel 不读 ATen 的线程数设置)。
+        thread_local bool intraop_threads_set = false;
+        if (!intraop_threads_set) {
+            at::set_num_threads(1);
+            omp_set_num_threads(1);
+            intraop_threads_set = true;
+        }
         // std::cerr << "RolloutWithModel\n";
         std::vector<std::vector<uint64_t>*> retire_list;
         retire_lists.InheritThreadLocalRetireList(retire_list);

@@ -24,7 +24,9 @@ ext_modules = [
         # NOTE(junhaozhang): 必须保留 torch 库的 NEEDED 项——Debian 链接器默认 --as-needed
         # 会把它们丢掉, 导致 .so 里的 AutogradMeta vtable 等符号在加载时找不到定义
         # (定义在 libtorch_cpu, 由 import torch 时 RTLD_GLOBAL 加载的 libtorch_cuda 带入全局)。
-        extra_link_args=['-g', '-Wl,--no-as-needed', '-L/usr/local/lib', '-lfolly', '-ldl', '-lgflags', '-lglog', '-lpthread', '-lfmt', '-lunwind', '-ldouble-conversion', '-liberty', '-lstdc++', '-levent', '-lboost_context', '-L/usr/local/lib/python3.9/dist-packages/torch/lib', '-ltorch_cuda', '-lc10_cuda', '-ltorch_global_deps', '-ltorch', '-lc10',],
+        # NOTE(junhaozhang): -lgomp 解析 RolloutWithModel 里的 omp_set_num_threads
+        # (关掉 oneDNN conv 的 OMP 并行, 见 hpp 注释); 运行时复用 torch 已加载的 libgomp。
+        extra_link_args=['-g', '-Wl,--no-as-needed', '-L/usr/local/lib', '-lfolly', '-ldl', '-lgflags', '-lglog', '-lpthread', '-lfmt', '-lunwind', '-ldouble-conversion', '-liberty', '-lstdc++', '-levent', '-lboost_context', '-lgomp', '-L/usr/local/lib/python3.9/dist-packages/torch/lib', '-ltorch_cuda', '-lc10_cuda', '-ltorch_global_deps', '-ltorch', '-lc10',],
     ),
 ]
 
