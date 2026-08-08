@@ -774,6 +774,17 @@ public:
         delete root_;
     }
 
+    // 清空搜索树回到空棋盘开局状态(等价于重建 Framework), 但保留线程池不重建:
+    // 线程 id 不变, ThreadLocalModels 里按 thread id 缓存的模型可跨局复用。
+    // NOTE(junhaozhang): 若每局新建 Framework, 新线程池的新 thread id 会让
+    // ThreadLocalModels::models_ 每局永久多缓存 cores 份 torch 模块(内存随局数泄漏)。
+    void Reset() {
+        delete root_;
+        root_ = new TreeNode<BOARD_SIZE, WITH_MODEL>();
+        last_move_ = { -1, -1 };
+        is_last_black_ = false;
+    }
+
     bool StateEquals(std::vector<std::vector<int>>& board, bool is_last_black) const {
         if (is_last_black != is_last_black_) {
 std::cerr << "Last black not equal!" << std::endl;

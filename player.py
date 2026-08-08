@@ -44,7 +44,10 @@ class PureMCTSPlayer:
         return False, False
 
     def reset(self):
-        self.game = None
+        # 有 framework 时只清搜索树、保留线程池(C++ Reset), 避免每局重建 16 个线程;
+        # game 为 None 时保持惰性构造(首次 get_action 按当时棋盘建, 支持中途入局)。
+        if self.game:
+            self.game.Reset()
 
     def play(self, move):
         # 还没轮到自己走过棋时 game 尚未创建, 首次 get_action 会直接按当前棋盘构建
@@ -123,7 +126,10 @@ class AlphaZeroPlayer:
         return move, move_probs
 
     def reset(self):
-        self.game = gomoku_ai.AlphaZeroMCTSFramework11(self.cores, self.c_puct, self.reuse_states)
+        # NOTE(junhaozhang): 不能每局新建 Framework —— 新线程池产生新 thread id,
+        # C++ ThreadLocalModels 会按 thread id 永久累积 torch 模块(每局 +cores 份,
+        # 打几局就 OOM)。Reset 只清搜索树, 线程池与模型缓存跨局复用。
+        self.game.Reset()
 
     def play(self, move):
         self.game.Play(move[0], move[1])
