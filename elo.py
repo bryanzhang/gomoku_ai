@@ -1,12 +1,14 @@
 #! /usr/bin/python3
 
 # 两个 player 的 Elo 跑分脚本: 交替执黑, 各执黑一半局数, 输出分先手的胜率和 Elo 差。
-# 每个 player 都可以是 AlphaZero(带模型文件) 或纯 MCTS(model-free)。
+# 每个 player 都可以是 AlphaZero(带模型文件) 或纯 MCTS(model-free):
+# 由 --{a,b}-model 是否非空决定 —— 非空用 AlphaZero, 置空(--a-model=)用纯 MCTS。
 #
 # 示例:
 #   ./elo.py                                        # 默认: A=AlphaZero(./current_policy.model) vs B=纯MCTS(10万次模拟)
-#   ./elo.py -n 40 --b-type alphazero --b-model ./best_policy.model
+#   ./elo.py -n 40 --b-model ./best_policy.model    # 两个模型对打
 #   ./elo.py --a-model ./gomoku_model.pt --a-simulations 2000
+#   ./elo.py --a-model= --a-simulations 50000       # A 也用纯 MCTS
 
 import argparse
 import math
@@ -57,18 +59,16 @@ def prepare_model_path(model_path, tag):
 
 
 def build_player(tag, args):
-    ptype = getattr(args, f'{tag}_type')
     sims = getattr(args, f'{tag}_simulations')
     cores = getattr(args, f'{tag}_cores')
     c_puct = getattr(args, f'{tag}_c_puct')
     reuse = getattr(args, f'{tag}_reuse_states')
-    if ptype == 'mcts':
+    model = getattr(args, f'{tag}_model')
+    # 模型路径非空 -> AlphaZero(带模型); 空 -> 纯 MCTS(model-free)
+    if not model:
         player = PureMCTSPlayer(sims, cores, c_puct, reuse)
         desc = f"PureMCTS(sims={sims}, cores={cores}, c_puct={c_puct}, reuse_states={reuse})"
     else:
-        model = getattr(args, f'{tag}_model')
-        if not model:
-            raise ValueError(f"player {tag}: --{tag}-model is required for alphazero type")
         temp = getattr(args, f'{tag}_temperature')
         ts_path = prepare_model_path(model, tag)
         player = AlphaZeroPlayerWithTemp(sims, ts_path, cores, c_puct, reuse, temperature=temp)
@@ -98,13 +98,12 @@ def main():
     parser.add_argument('-n', '--games', type=int, default=20,
                         help='total number of games (should be even so each player gets black half the time)')
 
-    def add_player_args(tag, ptype, model, sims, c_puct):
+    def add_player_args(tag, model, sims, c_puct):
         g = parser.add_argument_group(f'player {tag}')
-        g.add_argument(f'--{tag}-type', choices=['alphazero', 'mcts'], default=ptype,
-                       help=f'player {tag} type: alphazero (neural net guided) or mcts (model-free)')
         g.add_argument(f'--{tag}-model', default=model,
-                       help=f'player {tag} model file for alphazero: .model state_dict/checkpoint '
-                            f'or .pt torchscript (used directly)')
+                       help=f'player {tag} model file: .model/.ckpt state_dict/checkpoint '
+                            f'或 .pt torchscript(直接使用); 非空即 AlphaZero, 置空(--{tag}-model=)'
+                            f'则为纯 MCTS(model-free)')
         g.add_argument(f'--{tag}-simulations', type=int, default=sims,
                        help=f'player {tag} MCTS simulation count per move')
         g.add_argument(f'--{tag}-cores', type=int, default=16,
@@ -117,8 +116,8 @@ def main():
                        help=f'player {tag} get_action temperature (alphazero only; <=1e-2 means greedy)')
         g.add_argument(f'--{tag}-name', default=None, help=f'player {tag} display name')
 
-    add_player_args('a', 'alphazero', './current_policy.model', 1000, 5.0)
-    add_player_args('b', 'mcts', None, 100000, 2.0)
+    add_player_args('a', './current_policy.model', 1000, 5.0)
+    add_player_args('b', None, 100000, 2.0)
     args = parser.parse_args()
 
     n_games = args.games

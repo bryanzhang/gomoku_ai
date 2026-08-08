@@ -107,8 +107,7 @@ class AlphaZeroPlayer:
             #np_board[x][y] = 0
 
         if not self.game.StateEquals(np_board, is_last_black):
-            print('State not equal!', file=sys.stderr)
-            raise
+            raise RuntimeError('State not equal!')
 
         move_probs = np.zeros(11 * 11)
         sensible_moves, sensible_probs = self.game.SearchBestMove(self.simulate_times, self.model_path, 1.0)

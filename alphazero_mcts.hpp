@@ -302,6 +302,24 @@ public:
         return *entry.models;
     }
 
+    // NOTE(junhaozhang): torch::jit::load 抛出的 c10::Error 在 folly worker 里无法
+    // 安全回传( unwind 时直接 abort 整个进程, 实测), 所以这里对"模型文件正被替换/
+    // 暂时不可读"做有限退避重试; 只有彻底失败才把异常抛出去。
+    static torch::jit::script::Module LoadWithRetry(const std::string& path, int max_retries = 100) {
+        for (int attempt = 0; ; ++attempt) {
+            try {
+                return torch::jit::load(path);
+            } catch (const std::exception& e) {
+                if (attempt >= max_retries) {
+                    std::cerr << format("FATAL: load model %s failed after %d retries: %s\n",
+                                        path.c_str(), max_retries, e.what());
+                    throw;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    }
+
     torch::jit::script::Module& GetThreadLocalModel() {
         std::thread::id this_id = std::this_thread::get_id();
         {
@@ -312,7 +330,7 @@ public:
         }
         }
 
-        torch::jit::script::Module module = torch::jit::load(model_path_);
+        torch::jit::script::Module module = LoadWithRetry(model_path_);
         // std::cerr << format("Thread #%llu Model load successfully!\n", *(uint64_t*)&this_id);
         std::unique_lock wlock(mutex_);
         models_[this_id] = std::move(module);

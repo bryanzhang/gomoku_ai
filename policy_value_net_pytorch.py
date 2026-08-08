@@ -109,7 +109,12 @@ class PolicyValueNet():
         # .eval() 只作用于 trace 副本, 不改变源网络的 training 状态;
         # 折叠仅为浮点重排, 推理结果差异在 1e-6 量级(已用真实棋盘数据校验)。
         traced_script_module = torch.jit.freeze(traced_script_module.eval())
-        traced_script_module.save(model_file)
+        # NOTE(junhaozhang): 必须原子写! C++ 侧 ThreadLocalModels 靠 mtime 侦测模型更新
+        # 并即时 reload; 直接覆写会让 worker 读到写一半的文件, torch::jit::load 抛出的
+        # c10::Error 在 folly worker 里无法安全回传, 会直接 abort 整个进程(实测)。
+        tmp_file = model_file + '.tmp'
+        traced_script_module.save(tmp_file)
+        os.replace(tmp_file, model_file)
 
     def get_policy_param(self):
         return self.policy_value_net.state_dict()
