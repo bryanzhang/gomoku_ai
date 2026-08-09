@@ -6,6 +6,7 @@
 # trace, 换结构不需要改任何搜索代码。v1/v2 权重互不通用, load_net_any_arch 会按权重内容
 # 自动识别结构(并推断 v2 的 blocks/channels)。
 
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -91,6 +92,51 @@ class PolicyValueNetV2(PolicyValueNet):
     def train_step(self, state_batch, mcts_probs, winner_batch, lr):
         self.policy_value_net.train()
         return super().train_step(state_batch, mcts_probs, winner_batch, lr)
+
+    # 导出用副本: 深拷贝训练网络, 把每个 conv(无bias)+BN 对折叠成带 bias 的 conv、
+    # BN 换成 Identity, 效果等同 torch.jit.freeze 的 BN 折叠(数值 ~1e-6 一致)。
+    # 折叠只发生一次; 之后每次导出前 _refresh_export_net 按训练网络的当前权重重算
+    # 折叠值, traced 模块与副本共享参数存储, 无需重新 trace/freeze(那会每调一次
+    # 泄漏数 MB, 见基类 save_model_with_torchscript 的注释)。
+    def _conv_bn_pairs(self, net):
+        pairs = [(net.conv1, net.bn1)]
+        for blk in net.blocks:
+            pairs.append((blk.conv1, blk.bn1))
+            pairs.append((blk.conv2, blk.bn2))
+        pairs.append((net.act_conv1, net.act_bn))
+        pairs.append((net.val_conv1, net.val_bn))
+        return pairs
+
+    def _build_export_net(self):
+        if getattr(self, '_export_folded_net', None) is None:
+            folded = copy.deepcopy(self.policy_value_net).eval()
+            # 给每个无 bias 的 conv 补上 bias 参数(折叠后 BN 的仿射项进这里)
+            for conv, _ in self._conv_bn_pairs(folded):
+                conv.bias = nn.Parameter(torch.zeros(conv.out_channels))
+            # BN 已折叠进 conv, 换成 Identity 使 forward 不再出现 BN
+            folded.bn1 = nn.Identity()
+            for blk in folded.blocks:
+                blk.bn1 = nn.Identity()
+                blk.bn2 = nn.Identity()
+            folded.act_bn = nn.Identity()
+            folded.val_bn = nn.Identity()
+            self._export_folded_net = folded
+            self._refresh_export_net()
+        return self._export_folded_net
+
+    # 把训练网络当前的 conv+BN 折叠进导出副本: W' = W * γ/√(σ²+ε), b' = β - μγ/√(σ²+ε)
+    def _refresh_export_net(self):
+        src_net = self.policy_value_net
+        dst_net = self._export_folded_net
+        with torch.no_grad():
+            for (s_conv, s_bn), (d_conv, _) in zip(self._conv_bn_pairs(src_net),
+                                                   self._conv_bn_pairs(dst_net)):
+                scale = s_bn.weight / torch.sqrt(s_bn.running_var + s_bn.eps)
+                d_conv.weight.copy_(s_conv.weight * scale.view(-1, 1, 1, 1))
+                d_conv.bias.copy_(s_bn.bias - s_bn.running_mean * scale)
+            # 非折叠参数(fc 层)直接同步
+            for name in ('act_fc1', 'val_fc1', 'val_fc2'):
+                getattr(dst_net, name).load_state_dict(getattr(src_net, name).state_dict())
 
     def save_model_with_torchscript(self, model_file):
         was_training = self.policy_value_net.training

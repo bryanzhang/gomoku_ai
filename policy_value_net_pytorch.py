@@ -100,20 +100,31 @@ class PolicyValueNet():
         entropy = -torch.mean(torch.sum(torch.exp(log_act_probs) * log_act_probs, 1))
         return loss.item(), entropy.item()
 
+    # 导出用的网络: v1 无 BN, 直接用训练网络本身(trace 与源共享参数存储, 权重更新
+    # 自动生效)。v2 带 BN, 会覆盖为"BN 折叠进 conv 的副本"(等效 torch.jit.freeze)。
+    def _build_export_net(self):
+        return self.policy_value_net
+
+    # 每次导出前把训练权重同步进导出网络; v1 共享存储, 无需任何操作
+    def _refresh_export_net(self):
+        pass
+
     # for cpp-usage
     def save_model_with_torchscript(self, model_file):
-        example_input = torch.randn(1, 4, self.board_width, self.board_height)
-        traced_script_module = torch.jit.trace(self.policy_value_net, example_input)
-        # NOTE(junhaozhang): freeze 把参数常量折叠、BatchNorm 折进相邻 conv
-        # (v2 每个 ResBlock 少 2 次 BN kernel), C++ 侧单线程前向实测提速 ~25%。
-        # .eval() 只作用于 trace 副本, 不改变源网络的 training 状态;
-        # 折叠仅为浮点重排, 推理结果差异在 1e-6 量级(已用真实棋盘数据校验)。
-        traced_script_module = torch.jit.freeze(traced_script_module.eval())
+        # NOTE(junhaozhang): torch.jit.trace/freeze 每调一次会泄漏数 MB C++ 内存
+        # (torch 2.8 实测, gc.collect 无效), 训练一局一导出、几千局累计十几 GB 会 OOM。
+        # 因此 trace 只在首次导出时做一次, 之后复用同一 traced 模块(其参数与导出网络
+        # 共享存储, 实测权重更新自动可见); BN 折叠改由 _build_export_net 在 Python 侧
+        # 手工完成(v2), 效果等同 freeze 但不反复泄漏。
+        if getattr(self, '_export_traced', None) is None:
+            example_input = torch.randn(1, 4, self.board_width, self.board_height)
+            self._export_traced = torch.jit.trace(self._build_export_net(), example_input)
+        self._refresh_export_net()
         # NOTE(junhaozhang): 必须原子写! C++ 侧 ThreadLocalModels 靠 mtime 侦测模型更新
         # 并即时 reload; 直接覆写会让 worker 读到写一半的文件, torch::jit::load 抛出的
         # c10::Error 在 folly worker 里无法安全回传, 会直接 abort 整个进程(实测)。
         tmp_file = model_file + '.tmp'
-        traced_script_module.save(tmp_file)
+        self._export_traced.save(tmp_file)
         os.replace(tmp_file, model_file)
 
     def get_policy_param(self):
