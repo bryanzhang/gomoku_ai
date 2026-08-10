@@ -157,8 +157,13 @@ public:
 
     HPRecType<TYPE>* Acquire() {
        HPRecType<TYPE>* p = head_;
-       bool expected_false = false;
        for (; p; p = p->next_.load()) {
+           // NOTE(junhaozhang): expected 必须在每次迭代内重置! CAS 失败会把 expected
+           // 改写成当前值(true); 不重置的话, 下一轮 CAS 拿 true 去比较别人的活跃 rec
+           // 会"成功"返回 —— 两个线程共享同一 HP rec, hazard 保护失效, 退休的
+           // children vector 被提前回收, 读到野指针后在 uniform_int_distribution(0,-1)
+           // 上无限递归爆栈(8000 局训练的 core 实锤)。
+           bool expected_false = false;
            if (!p->active_.compare_exchange_strong(expected_false, true)) {
                continue;
            }
