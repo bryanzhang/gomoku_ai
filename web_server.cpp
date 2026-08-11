@@ -47,6 +47,17 @@ struct ServerConfig {
     bool UseModel() const { return !model_path.empty(); }
 };
 
+// 每盘可改的对局配置(/new_game 接口传入, 缺省字段沿用当前值); 初始值继承命令行。
+// model_path 为空 -> 纯 MCTS; 非空 -> AlphaZero(策略价值网络)。
+struct GameConfig {
+    std::string model_path;
+    int simulate_times = 0;
+    float c_puct = 0.0f;
+    bool reuse_tree_states = true;
+    int cores = 16;
+    int human_color = 1;         // 1=玩家执黑先行(默认), -1=玩家执白(AI 先行)
+};
+
 // 在程序启动时初始化Python解释器
 bool init_python_environment() {
     if (!Py_IsInitialized()) {
@@ -99,7 +110,7 @@ public:
 
 class PureMCTSEngine : public AiEngine {
 public:
-    PureMCTSEngine(const ServerConfig& config, std::vector<std::vector<int>>& board, Move last_move)
+    PureMCTSEngine(const GameConfig& config, std::vector<std::vector<int>>& board, Move last_move)
         : simulate_times_(config.simulate_times),
           game_(config.cores, board, last_move, config.c_puct, config.reuse_tree_states) {}
 
@@ -121,9 +132,9 @@ private:
 
 class AlphaZeroEngine : public AiEngine {
 public:
-    AlphaZeroEngine(const ServerConfig& config, std::vector<std::vector<int>>& board, Move last_move)
+    AlphaZeroEngine(const GameConfig& config, float temperature, std::vector<std::vector<int>>& board, Move last_move)
         : simulate_times_(config.simulate_times),
-          temperature_(config.temperature),
+          temperature_(temperature),
           model_path_(config.model_path),
           game_(config.cores, board, last_move, config.c_puct, config.reuse_tree_states) {}
 
@@ -181,23 +192,141 @@ private:
     AlphaZeroMCTS game_;
 };
 
-inline std::unique_ptr<AiEngine> CreateEngine(const ServerConfig& config,
+inline std::unique_ptr<AiEngine> CreateEngine(const GameConfig& config,
+                                             float temperature,
                                              std::vector<std::vector<int>>& board,
                                              Move last_move) {
-    if (config.UseModel()) {
-        return std::make_unique<AlphaZeroEngine>(config, board, last_move);
+    if (!config.model_path.empty()) {
+        return std::make_unique<AlphaZeroEngine>(config, temperature, board, last_move);
     }
     return std::make_unique<PureMCTSEngine>(config, board, last_move);
 }
 
+// 定义在文件后部(main 之前), GameServer 的 /new_game 需要用
+std::string ExportToTorchScriptIfNeeded(const std::string& model_path);
+bool CheckModel(const std::string& model_path);
+
 class GameServer {
 private:
     ServerConfig config_;
+    GameConfig gameCfg_;          // 当前对局配置(可被 /new_game 每盘修改)
     std::unique_ptr<AiEngine> currentGame;
     std::mutex gameMutex;
+    // .model/.ckpt 转 torchscript 的单条目缓存: 同一源路径不重复导出
+    std::string exportCacheSrc_, exportCacheTs_;
+
+    // 解析模型路径(必要时转 torchscript 并校验), 失败返回空串
+    std::string resolveModel(const std::string& path) {
+        if (path == exportCacheSrc_) {
+            return exportCacheTs_;
+        }
+        std::string ts = ExportToTorchScriptIfNeeded(path);
+        if (ts.empty() || !CheckModel(ts)) {
+            return "";
+        }
+        exportCacheSrc_ = path;
+        exportCacheTs_ = ts;
+        return ts;
+    }
+
+    // AI(黑棋)先行的开局: 空棋盘建引擎, 搜索并落下第一手
+    void aiOpenMove(crow::json::wvalue& res) {
+        std::vector<std::vector<int>> empty(BOARD_SIZE, std::vector<int>(BOARD_SIZE, 0));
+        currentGame = CreateEngine(gameCfg_, config_.temperature, empty, { -1, -1 });
+        auto [ax, ay] = currentGame->SearchBestMove();
+        currentGame->Play(ax, ay);
+        std::cout << "AI opens(black): (" << ax << "," << ay << ")" << std::endl;
+        res["ai_move"] = std::vector<int>{ax, ay};
+    }
 
 public:
-    explicit GameServer(const ServerConfig& config) : config_(config) {}
+    explicit GameServer(const ServerConfig& config) : config_(config) {
+        gameCfg_.model_path = config.model_path;
+        gameCfg_.simulate_times = config.simulate_times;
+        gameCfg_.c_puct = config.c_puct;
+        gameCfg_.reuse_tree_states = config.reuse_tree_states;
+        gameCfg_.cores = config.cores;
+        gameCfg_.human_color = 1;
+    }
+
+    // 前端拉取默认配置做表单预填
+    void handleGetConfig(crow::json::wvalue& res) {
+        std::lock_guard<std::mutex> lock(gameMutex);
+        res["model"] = config_.model_path;
+        res["simulate_times"] = gameCfg_.simulate_times;
+        res["c_puct"] = gameCfg_.c_puct;
+        res["reuse_states"] = gameCfg_.reuse_tree_states;
+        res["cores"] = gameCfg_.cores;
+        res["human_color"] = gameCfg_.human_color;
+        res["ai_type"] = gameCfg_.model_path.empty() ? "pure" : "model";
+    }
+
+    // 每盘开局: 可选地携带新配置(ai_type/model/simulate_times/c_puct/reuse_states/
+    // cores/human_color), 缺省字段沿用当前配置。玩家执白时 AI 先行并返回 ai_move。
+    void handleNewGame(const crow::request& req, crow::json::wvalue& res) {
+        std::lock_guard<std::mutex> lock(gameMutex);
+        if (!req.body.empty()) {
+            auto data = json::parse(req.body, nullptr, false);
+            if (data.is_discarded()) {
+                res["result"] = "error";
+                res["message"] = "invalid json body";
+                return;
+            }
+            if (data.contains("ai_type")) {
+                std::string t = data["ai_type"].get<std::string>();
+                if (t == "pure") {
+                    gameCfg_.model_path.clear();
+                } else if (t == "model" && gameCfg_.model_path.empty()
+                           && !(data.contains("model") && !data["model"].get<std::string>().empty())) {
+                    res["result"] = "error";
+                    res["message"] = "ai_type=model 但未提供模型路径(命令行也未指定)";
+                    return;
+                }
+            }
+            if (data.contains("model")) {
+                std::string m = data["model"].get<std::string>();
+                if (!m.empty()) {
+                    std::string ts = resolveModel(m);
+                    if (ts.empty()) {
+                        res["result"] = "error";
+                        res["message"] = "模型加载失败: " + m;
+                        return;
+                    }
+                    gameCfg_.model_path = ts;
+                }
+            }
+            if (data.contains("simulate_times")) {
+                gameCfg_.simulate_times = data["simulate_times"].get<int>();
+            }
+            if (data.contains("c_puct")) {
+                gameCfg_.c_puct = (float)data["c_puct"].get<double>();
+            }
+            if (data.contains("reuse_states")) {
+                gameCfg_.reuse_tree_states = data["reuse_states"].get<bool>();
+            }
+            if (data.contains("cores")) {
+                gameCfg_.cores = data["cores"].get<int>();
+            }
+            if (data.contains("human_color")) {
+                int c = data["human_color"].get<int>();
+                if (c != 1 && c != -1) {
+                    res["result"] = "error";
+                    res["message"] = "human_color 只能是 1(执黑) 或 -1(执白)";
+                    return;
+                }
+                gameCfg_.human_color = c;
+            }
+        }
+        currentGame.reset();
+        std::cout << "New game: ai=" << (gameCfg_.model_path.empty() ? "pure-mcts" : gameCfg_.model_path)
+                  << ", sims=" << gameCfg_.simulate_times << ", c_puct=" << gameCfg_.c_puct
+                  << ", cores=" << gameCfg_.cores << ", reuse=" << gameCfg_.reuse_tree_states
+                  << ", human_color=" << gameCfg_.human_color << std::endl;
+        res["result"] = "ok";
+        if (gameCfg_.human_color == -1) {
+            aiOpenMove(res);  // 玩家执白, AI 执黑先行
+        }
+    }
 
     void handleMove(const crow::request& req, crow::json::wvalue& res) {
         std::lock_guard<std::mutex> lock(gameMutex);
@@ -212,14 +341,17 @@ public:
         std::cout << "Human move: " << x << ", " << y << std::endl;
 
         // 检查是否需要创建新游戏
-        if (!currentGame || !currentGame->StateEquals(boardArr, false)) {
+        // 此时棋盘上最后一手是 AI 落的, AI 颜色 = -human_color, 故:
+        // 玩家执黑(human_color=1) -> 上一手是白棋; 玩家执白 -> 上一手是黑棋
+        bool last_black = (gameCfg_.human_color == -1);
+        if (!currentGame || !currentGame->StateEquals(boardArr, last_black)) {
             if (IsEmptyBoard(boardArr)) {
                 std::cout << "Initializing a new game!" << std::endl;
             } else {
                 std::cout << "WARNING: Re-Initializing the game unexpectedly!" << std::endl;
             }
-            boardArr[x][y] = 1;
-            currentGame = CreateEngine(config_, boardArr, std::make_pair(x, y));
+            boardArr[x][y] = gameCfg_.human_color;  // 落上玩家这一手(黑 1 / 白 -1)
+            currentGame = CreateEngine(gameCfg_, config_.temperature, boardArr, std::make_pair(x, y));
         } else {
             currentGame->Play(x, y);
         }
@@ -272,10 +404,14 @@ public:
         }
     }
 
+    // 沿用当前配置重开一局; 玩家执白时 AI 先行并返回 ai_move
     void handleRestart(const crow::request& req, crow::json::wvalue& res) {
         std::lock_guard<std::mutex> lock(gameMutex);
         currentGame.reset();
         res["result"] = "ok";
+        if (gameCfg_.human_color == -1) {
+            aiOpenMove(res);
+        }
     }
 
     void serveStaticFiles(crow::SimpleApp& app) {
@@ -500,8 +636,28 @@ int main(int argc, char** argv) {
             return res;
         });
 
+    CROW_ROUTE(app, "/new_game")
+        .methods("POST"_method)
+        ([&server](const crow::request& req) {
+            crow::json::wvalue res;
+            server.handleNewGame(req, res);
+            return res;
+        });
+
+    CROW_ROUTE(app, "/config")
+        ([&server](const crow::request& req) {
+            crow::json::wvalue res;
+            server.handleGetConfig(res);
+            return res;
+        });
+
     // 静态文件服务
     server.serveStaticFiles(app);
+
+    // NOTE(junhaozhang): 必须在进入 Crow 事件循环前释放主线程的 GIL!
+    // py::initialize_interpreter() 后主线程一直持有 GIL, 若不释放, /new_game 里
+    // Crow worker 线程的 py::gil_scoped_acquire(模型转换)会永远阻塞(实测卡死)。
+    py::gil_scoped_release gil_release;
 
     std::cout << "Server running on http://0.0.0.0:" << config.port << std::endl;
     app.port(config.port).multithreaded().run();

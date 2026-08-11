@@ -7,27 +7,65 @@
         canvas {
             border: 1px solid #000;
         }
+        #config-panel {
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            max-width: 600px;
+            line-height: 2.2;
+        }
+        #config-panel input[type=number] { width: 80px; }
+        #config-panel input[type=text] { width: 260px; }
+        #config-panel .item { margin-right: 14px; }
     </style>
 </head>
 <body>
     <h1>五子棋对战 AI</h1>
+
+    <div id="config-panel">
+        <div>
+            <span class="item">AI:
+                <select id="ai_type">
+                    <option value="model">策略价值网络</option>
+                    <option value="pure">纯 MCTS</option>
+                </select>
+            </span>
+            <span class="item">模型: <input type="text" id="model" placeholder="缺省用命令行默认模型"></span>
+            <span class="item">执子:
+                <select id="human_color">
+                    <option value="1">执黑(先行)</option>
+                    <option value="-1">执白</option>
+                </select>
+            </span>
+        </div>
+        <div>
+            <span class="item">模拟次数: <input type="number" id="simulate_times" min="1"></span>
+            <span class="item">c_puct: <input type="number" id="c_puct" step="0.1" min="0.01"></span>
+            <span class="item">线程数: <input type="number" id="cores" min="1"></span>
+            <span class="item"><label><input type="checkbox" id="reuse_states" checked>复用搜索树</label></span>
+            <span class="item"><button id="new_game">开始新局</button></span>
+        </div>
+    </div>
+
     <canvas id="chessboard" width="600" height="600"></canvas>
     <p id="message"></p>
-    <button id="restart">重新开始</button>
 
     <script>
         const canvas = document.getElementById('chessboard');
         const ctx = canvas.getContext('2d');
         const message = document.getElementById('message');
-        const restartBtn = document.getElementById('restart');
+        const newGameBtn = document.getElementById('new_game');
+        const aiTypeSel = document.getElementById('ai_type');
+        const modelInput = document.getElementById('model');
 
-        // const boardSize = 15; // 15x15的棋盘
-        // const boardSize = 9; // 9x9的棋盘
         const boardSize = 11; // 11x11的棋盘
         const cellSize = canvas.width / boardSize;
 
-        let board = []; // 前端的棋盘状态
+        let board = []; // 前端的棋盘状态: 1=黑, -1=白, 0=空
         let gameOver = false;
+        let humanColor = 1;   // 1=玩家执黑, -1=玩家执白
+        let aiColor = -1;
 
         // 初始化棋盘
         function initBoard() {
@@ -35,7 +73,7 @@
             for (let i = 0; i < boardSize; i++) {
                 board[i] = [];
                 for (let j = 0; j < boardSize; j++) {
-                    board[i][j] = 0; // 0表示空位
+                    board[i][j] = 0;
                 }
             }
             gameOver = false;
@@ -46,7 +84,6 @@
         // 绘制棋盘
         function drawBoard() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            // 绘制网格线
             for (let i = 0; i < boardSize; i++) {
                 ctx.beginPath();
                 ctx.moveTo(cellSize / 2, cellSize / 2 + i * cellSize);
@@ -58,22 +95,19 @@
                 ctx.lineTo(cellSize / 2 + i * cellSize, canvas.height - cellSize / 2);
                 ctx.stroke();
             }
-            // 绘制棋子
             for (let x = 0; x < boardSize; x++) {
                 for (let y = 0; y < boardSize; y++) {
                     if (board[x][y] === 1) {
-                        // 玩家棋子（黑色）
                         drawPiece(x, y, true);
                     } else if (board[x][y] === -1) {
-                        // AI棋子（白色）
                         drawPiece(x, y, false);
                     }
                 }
             }
         }
 
-        // 绘制棋子
-        function drawPiece(x, y, isPlayer) {
+        // 绘制棋子 (isBlack: true 黑棋, false 白棋)
+        function drawPiece(x, y, isBlack) {
             ctx.beginPath();
             ctx.arc(
                 cellSize / 2 + x * cellSize,
@@ -91,17 +125,22 @@
                 cellSize / 2 + y * cellSize,
                 0
             );
-            if (isPlayer) {
-                // 黑色棋子
+            if (isBlack) {
                 gradient.addColorStop(0, '#0A0A0A');
                 gradient.addColorStop(1, '#636766');
             } else {
-                // 白色棋子
                 gradient.addColorStop(0, '#D1D1D1');
                 gradient.addColorStop(1, '#F9F9F9');
             }
             ctx.fillStyle = gradient;
             ctx.fill();
+        }
+
+        // 落下 AI 的一手
+        function placeAiMove(ai_move) {
+            const [ai_x, ai_y] = ai_move;
+            board[ai_x][ai_y] = aiColor;
+            drawBoard();
         }
 
         // 处理鼠标点击事件
@@ -111,14 +150,12 @@
             const x = Math.floor((e.clientX - rect.left) / cellSize);
             const y = Math.floor((e.clientY - rect.top) / cellSize);
 
-            // 判断该位置是否为空
             if (board[x][y] !== 0) return;
 
             // 玩家落子
-            board[x][y] = 1;
+            board[x][y] = humanColor;
             drawBoard();
 
-            // 检查是否胜利
             fetch('/handle_state', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -130,23 +167,18 @@
                     message.textContent = '你赢了！';
                     gameOver = true;
                 } else if (data.result === 'lose') {
-                    // AI 落子
-                    const [ai_x, ai_y] = data.ai_move;
-                    board[ai_x][ai_y] = -1;
-                    drawBoard();
+                    placeAiMove(data.ai_move);
                     message.textContent = 'AI赢了！';
                     gameOver = true;
                 } else if (data.result === 'continue') {
-                    // AI 落子
-                    const [ai_x, ai_y] = data.ai_move;
-                    board[ai_x][ai_y] = -1;
-                    drawBoard();
-
-                    // 检查是否平局或胜利
+                    placeAiMove(data.ai_move);
                     if (data.status === 'draw') {
                         message.textContent = '平局！';
                         gameOver = true;
                     }
+                } else if (data.result === 'draw') {
+                    message.textContent = '平局！';
+                    gameOver = true;
                 }
             })
             .catch(error => {
@@ -154,22 +186,65 @@
             });
         };
 
-        // 重新开始按钮
-        restartBtn.onclick = function() {
-            fetch('/restart', {method: 'POST'})
+        // AI 类型切换时启停模型输入框
+        function syncModelInput() {
+            modelInput.disabled = (aiTypeSel.value !== 'model');
+        }
+        aiTypeSel.onchange = syncModelInput;
+
+        // 开始新局: 携带当前配置; 玩家执白时服务器会返回 AI 的首手
+        newGameBtn.onclick = function() {
+            const cfg = {
+                ai_type: aiTypeSel.value,
+                model: modelInput.value,
+                simulate_times: parseInt(document.getElementById('simulate_times').value),
+                c_puct: parseFloat(document.getElementById('c_puct').value),
+                cores: parseInt(document.getElementById('cores').value),
+                reuse_states: document.getElementById('reuse_states').checked,
+                human_color: parseInt(document.getElementById('human_color').value)
+            };
+            message.textContent = 'AI 思考首手中...';
+            fetch('/new_game', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(cfg)
+            })
             .then(response => response.json())
             .then(data => {
-                if (data.result === 'ok') {
-                    initBoard();
+                if (data.result !== 'ok') {
+                    message.textContent = '开局失败: ' + (data.message || '未知错误');
+                    return;
                 }
+                humanColor = cfg.human_color;
+                aiColor = -humanColor;
+                initBoard();
+                if (data.ai_move) {
+                    placeAiMove(data.ai_move);
+                    message.textContent = 'AI 已落子, 轮到你了';
+                }
+            })
+            .catch(error => {
+                message.textContent = '开局请求失败';
+                console.error('Error:', error);
             });
         };
 
-        // 初始化游戏
+        // 页面加载: 拉取服务器默认配置预填表单
+        fetch('/config')
+        .then(response => response.json())
+        .then(cfg => {
+            aiTypeSel.value = cfg.ai_type;
+            modelInput.value = cfg.model || '';
+            document.getElementById('simulate_times').value = cfg.simulate_times;
+            document.getElementById('c_puct').value = cfg.c_puct;
+            document.getElementById('cores').value = cfg.cores;
+            document.getElementById('reuse_states').checked = cfg.reuse_states;
+            document.getElementById('human_color').value = String(cfg.human_color);
+            syncModelInput();
+        })
+        .catch(error => console.error('Error:', error));
+
         initBoard();
     </script>
 </body>
 </html>
-
-
-
