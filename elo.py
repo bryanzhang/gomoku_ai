@@ -27,8 +27,6 @@ from policy_value_net_pytorch_v2 import load_net_any_arch
 from game import Game
 from player import AlphaZeroPlayer, PureMCTSPlayer
 
-BOARD_W = BOARD_H = 11
-
 
 # Game.start_play 调 get_action 时只传 return_prob, temperature 由这个子类注入,
 # 避免改 Game 的通用接口。
@@ -45,12 +43,12 @@ class AlphaZeroPlayerWithTemp(AlphaZeroPlayer):
 
 # AlphaZero 的 C++ 侧只认 torchscript(.pt); .model(state_dict/checkpoint) 先导出成 .pt。
 # 权重结构(v1 3conv / v2 ResNet)由 load_net_any_arch 按内容自动识别, 新旧 .model 都能转。
-def prepare_model_path(model_path, tag):
+def prepare_model_path(model_path, tag, board_width=11, board_height=11):
     if model_path.endswith('.pt'):
         return model_path
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"player {tag}: model file not found: {model_path}")
-    net = load_net_any_arch(BOARD_W, BOARD_H, model_path)
+    net = load_net_any_arch(board_width, board_height, model_path)
     fd, ts_path = tempfile.mkstemp(prefix=f'elo_{tag}_', suffix='.pt')
     os.close(fd)
     net.save_model_with_torchscript(ts_path)
@@ -64,14 +62,15 @@ def build_player(tag, args):
     c_puct = getattr(args, f'{tag}_c_puct')
     reuse = getattr(args, f'{tag}_reuse_states')
     model = getattr(args, f'{tag}_model')
+    board_size = args.board_size
     # 模型路径非空 -> AlphaZero(带模型); 空 -> 纯 MCTS(model-free)
     if not model:
-        player = PureMCTSPlayer(sims, cores, c_puct, reuse)
+        player = PureMCTSPlayer(board_size, sims, cores, c_puct, reuse)
         desc = f"PureMCTS(sims={sims}, cores={cores}, c_puct={c_puct}, reuse_states={reuse})"
     else:
         temp = getattr(args, f'{tag}_temperature')
-        ts_path = prepare_model_path(model, tag)
-        player = AlphaZeroPlayerWithTemp(sims, ts_path, cores, c_puct, reuse, temperature=temp)
+        ts_path = prepare_model_path(model, tag, board_size, board_size)
+        player = AlphaZeroPlayerWithTemp(board_size, sims, ts_path, cores, c_puct, reuse, temperature=temp)
         desc = (f"AlphaZero(model={model}, sims={sims}, cores={cores}, c_puct={c_puct}, "
                 f"reuse_states={reuse}, temperature={temp})")
     name = getattr(args, f'{tag}_name') or tag.upper()
@@ -97,6 +96,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-n', '--games', type=int, default=20,
                         help='total number of games (should be even so each player gets black half the time)')
+    parser.add_argument('--board-size', type=int, default=11, choices=[8, 9, 11, 15],
+                        help='棋盘边长(纯 MCTS 支持 8/9/11/15, AlphaZero 支持 8/11/15)')
 
     def add_player_args(tag, model, sims, c_puct):
         g = parser.add_argument_group(f'player {tag}')
@@ -130,7 +131,7 @@ def main():
     player_b, name_b, desc_b = build_player('b', args)
     print(f"A = {desc_a}\nB = {desc_b}", file=sys.stderr)
 
-    game = Game()
+    game = Game(args.board_size, args.board_size)
     # 按 A 的视角统计: [胜, 负, 和], 再按 A 执黑/执白分开
     stats = {'black': [0, 0, 0], 'white': [0, 0, 0]}
     start_time = time.time()

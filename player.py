@@ -5,8 +5,17 @@ import gomoku_ai
 import numpy as np
 import sys
 
+# 按棋盘尺寸选 C++ 绑定类(如 board_size=15 -> PureMCTSFramework15 / AlphaZeroMCTSFramework15)
+def _framework_class(prefix, board_size):
+    cls = getattr(gomoku_ai, f'{prefix}{board_size}', None)
+    if cls is None:
+        raise ValueError(f'gomoku_ai 不支持 {board_size}x{board_size} 棋盘(没有 {prefix}{board_size} 绑定)')
+    return cls
+
 class PureMCTSPlayer:
-    def __init__(self, simulate_times, cores, c_puct, reuse_states):
+    def __init__(self, board_size, simulate_times, cores, c_puct, reuse_states):
+        self.board_size = board_size
+        self.framework_cls = _framework_class('PureMCTSFramework', board_size)
         self.cores = cores
         self.c_puct = c_puct
         self.simulate_times = simulate_times
@@ -25,7 +34,7 @@ class PureMCTSPlayer:
         # Play 落每一手), 与 AlphaZeroPlayer 一致, 这里要拿完整棋盘做 StateEquals,
         # 不能把 last_move 的子摘掉(摘掉既会失配, 也会腐蚀 Game 的 board 引用)。
         if not self.game:
-            self.game = gomoku_ai.PureMCTSFramework11(self.cores, np_board, last_move, self.c_puct, self.reuse_states)
+            self.game = self.framework_cls(self.cores, np_board, last_move, self.c_puct, self.reuse_states)
         elif not self.game.StateEquals(np_board, is_last_black):
             print(f'State not equal!', file=sys.stderr)
             raise RuntimeError('State not equal!')
@@ -62,11 +71,12 @@ class AlphaZeroPlayer:
     # temperature 小于该阈值就当作 τ→0 处理, 直接走访问次数最多的一手
     GREEDY_TEMP = 1e-2
 
-    def __init__(self, simulate_times, model_path, cores, c_puct, reuse_states):
+    def __init__(self, board_size, simulate_times, model_path, cores, c_puct, reuse_states):
+        self.board_size = board_size
         self.cores = cores
         self.c_puct = c_puct
         self.reuse_states = reuse_states
-        self.game = gomoku_ai.AlphaZeroMCTSFramework11(cores, c_puct, reuse_states)
+        self.game = _framework_class('AlphaZeroMCTSFramework', board_size)(cores, c_puct, reuse_states)
         self.simulate_times = simulate_times
         self.model_path = model_path
 
@@ -109,7 +119,7 @@ class AlphaZeroPlayer:
         if not self.game.StateEquals(np_board, is_last_black):
             raise RuntimeError('State not equal!')
 
-        move_probs = np.zeros(11 * 11)
+        move_probs = np.zeros(self.board_size * self.board_size)
         sensible_moves, sensible_probs = self.game.SearchBestMove(self.simulate_times, self.model_path, 1.0)
         move_probs[sensible_moves] = sensible_probs  # 训练目标: 始终是 τ=1 的访问次数分布
         visit_probs = np.array(sensible_probs)
@@ -119,7 +129,7 @@ class AlphaZeroPlayer:
         if self_play and temperature > self.GREEDY_TEMP:
             select_probs = 0.75 * select_probs + 0.25 * np.random.dirichlet(0.3 * np.ones(len(select_probs)))
         move = np.random.choice(sensible_moves, p=select_probs)
-        move = (move % 11, move // 11)
+        move = (move % self.board_size, move // self.board_size)
         if not return_prob:
             return move
         return move, move_probs

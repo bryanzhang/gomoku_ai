@@ -143,4 +143,27 @@ PYBIND11_MODULE(gomoku_ai, m) {
         .def("IsEnd", &gomoku_ai::GomokuMCTSFramework<11, true>::IsEnd, "Is the game over(win,lose or draw)\n")
         .def("Reset", &gomoku_ai::GomokuMCTSFramework<11, true>::Reset, "Clear the search tree back to empty-board state, keeping the thread pool (and cached models) alive\n")
         .def("SearchBestMove", &gomoku_ai::GomokuMCTSFramework<11, true>::SearchBestMoveWithModel<>, py::arg("simulate_times"), py::arg("model_path"), py::arg("temperature"), "Monto-Carlo tree search for specified times to search the best move.\n");
+
+    py::class_<gomoku_ai::GomokuMCTSFramework<15, true>>(m, "AlphaZeroMCTSFramework15")
+        .def(py::init<int, float, bool>(),
+            py::arg("cores"), py::arg("c_puct"), py::arg("reuse_tree_states"),
+            "Construct a pure mcts game.\n\n"
+            "Args:\n"
+            "    c_puct(float): const cofficent of PUCT algorithm.\n"
+            "    reuse_tree_states(bool): reuse former MCTS tree states or not\n")
+        .def(py::init<int, py::array_t<int32_t>, gomoku_ai::Move, float, bool>(),
+            py::arg("cores"), py::arg("board"), py::arg("last_move"), py::arg("c_puct"), py::arg("reuse_tree_states"),
+            "Construct a pure mcts game.\n\n"
+            "Args:\n"
+            "    board(numpy(int32)): the board state (with last move)\n"
+            "    last_move((int,int)): last move coordination\n"
+            "    c_puct(float): const cofficent of PUCT algorithm.\n"
+            "    reuse_tree_states(bool): reuse former MCTS tree states or not\n")
+        .def("StateEquals", &gomoku_ai::GomokuMCTSFramework<15, true>::NpStateEquals, py::arg("np_board"), py::arg("s_last_black"), "Is the state equals the game's state\n")
+        .def("Play", &gomoku_ai::GomokuMCTSFramework<15, true>::Play, py::arg("x"), py::arg("y"),
+            "Make a move.\n")
+        .def("AvailableCount", &gomoku_ai::GomokuMCTSFramework<15, true>::AvailableCount, "How many grids there are to put pieces\n")
+        .def("IsEnd", &gomoku_ai::GomokuMCTSFramework<15, true>::IsEnd, "Is the game over(win,lose or draw)\n")
+        .def("Reset", &gomoku_ai::GomokuMCTSFramework<15, true>::Reset, "Clear the search tree back to empty-board state, keeping the thread pool (and cached models) alive\n")
+        .def("SearchBestMove", &gomoku_ai::GomokuMCTSFramework<15, true>::SearchBestMoveWithModel<>, py::arg("simulate_times"), py::arg("model_path"), py::arg("temperature"), "Monto-Carlo tree search for specified times to search the best move.\n");
 }

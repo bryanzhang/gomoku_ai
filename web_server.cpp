@@ -22,10 +22,10 @@
 #include "alphazero_mcts.hpp"
 
 using json = nlohmann::json;
-constexpr int BOARD_SIZE = 11;
-using PureMCTS = gomoku_ai::GomokuMCTSFramework<BOARD_SIZE, false>;
-using AlphaZeroMCTS = gomoku_ai::GomokuMCTSFramework<BOARD_SIZE, true>;
 using Move = gomoku_ai::Move;
+
+// 棋盘尺寸在编译期实例化(搜索树节点是模板), 运行期由 --board-size 分派到对应实例
+constexpr int DEFAULT_BOARD_SIZE = 11;
 
 // 纯 MCTS 无网络先验, 需要大量 rollout 才有棋力; AlphaZero 靠策略价值网络, 1000 次足够。
 constexpr int DEFAULT_PURE_MCTS_SIMULATE_TIMES = 1000000;
@@ -42,6 +42,7 @@ struct ServerConfig {
     float c_puct = -1.0f;        // <0 表示按 AI 类型取默认值
     int cores = 16;
     int port = 7000;
+    int board_size = DEFAULT_BOARD_SIZE;
     bool reuse_tree_states = true;
 
     bool UseModel() const { return !model_path.empty(); }
@@ -78,9 +79,9 @@ bool init_python_environment() {
 }
 
 inline bool IsEmptyBoard(const std::vector<std::vector<int>>& board) {
-    for (size_t i = 0; i < BOARD_SIZE; ++i) {
-        for (size_t j = 0; j < BOARD_SIZE; ++j) {
-            if (board[i][j] != 0) {
+    for (const auto& row : board) {
+        for (int v : row) {
+            if (v != 0) {
                 return false;
             }
         }
@@ -108,6 +109,7 @@ public:
     virtual int SimulateTimes() const = 0;
 };
 
+template <int BOARD_SIZE>
 class PureMCTSEngine : public AiEngine {
 public:
     PureMCTSEngine(const GameConfig& config, std::vector<std::vector<int>>& board, Move last_move)
@@ -127,9 +129,10 @@ public:
 
 private:
     int simulate_times_;
-    PureMCTS game_;
+    gomoku_ai::GomokuMCTSFramework<BOARD_SIZE, false> game_;
 };
 
+template <int BOARD_SIZE>
 class AlphaZeroEngine : public AiEngine {
 public:
     AlphaZeroEngine(const GameConfig& config, float temperature, std::vector<std::vector<int>>& board, Move last_move)
@@ -189,24 +192,36 @@ private:
     int simulate_times_;
     float temperature_;
     std::string model_path_;
-    AlphaZeroMCTS game_;
+    gomoku_ai::GomokuMCTSFramework<BOARD_SIZE, true> game_;
 };
 
+template <int BOARD_SIZE>
 inline std::unique_ptr<AiEngine> CreateEngine(const GameConfig& config,
                                              float temperature,
                                              std::vector<std::vector<int>>& board,
                                              Move last_move) {
     if (!config.model_path.empty()) {
-        return std::make_unique<AlphaZeroEngine>(config, temperature, board, last_move);
+        return std::make_unique<AlphaZeroEngine<BOARD_SIZE>>(config, temperature, board, last_move);
     }
-    return std::make_unique<PureMCTSEngine>(config, board, last_move);
+    return std::make_unique<PureMCTSEngine<BOARD_SIZE>>(config, board, last_move);
 }
 
 // 定义在文件后部(main 之前), GameServer 的 /new_game 需要用
-std::string ExportToTorchScriptIfNeeded(const std::string& model_path);
-bool CheckModel(const std::string& model_path);
+std::string ExportToTorchScriptIfNeeded(const std::string& model_path, int board_size);
+bool CheckModel(const std::string& model_path, int board_size);
 
-class GameServer {
+// 对 Crow 路由暴露的棋盘尺寸无关接口, main 按 --board-size 实例化 GameServerT<11/15>
+class IGameServer {
+public:
+    virtual ~IGameServer() = default;
+    virtual void handleGetConfig(crow::json::wvalue& res) = 0;
+    virtual void handleNewGame(const crow::request& req, crow::json::wvalue& res) = 0;
+    virtual void handleMove(const crow::request& req, crow::json::wvalue& res) = 0;
+    virtual void handleRestart(const crow::request& req, crow::json::wvalue& res) = 0;
+};
+
+template <int BOARD_SIZE>
+class GameServerT : public IGameServer {
 private:
     ServerConfig config_;
     GameConfig gameCfg_;          // 当前对局配置(可被 /new_game 每盘修改)
@@ -220,8 +235,8 @@ private:
         if (path == exportCacheSrc_) {
             return exportCacheTs_;
         }
-        std::string ts = ExportToTorchScriptIfNeeded(path);
-        if (ts.empty() || !CheckModel(ts)) {
+        std::string ts = ExportToTorchScriptIfNeeded(path, BOARD_SIZE);
+        if (ts.empty() || !CheckModel(ts, BOARD_SIZE)) {
             return "";
         }
         exportCacheSrc_ = path;
@@ -232,7 +247,7 @@ private:
     // AI(黑棋)先行的开局: 空棋盘建引擎, 搜索并落下第一手
     void aiOpenMove(crow::json::wvalue& res) {
         std::vector<std::vector<int>> empty(BOARD_SIZE, std::vector<int>(BOARD_SIZE, 0));
-        currentGame = CreateEngine(gameCfg_, config_.temperature, empty, { -1, -1 });
+        currentGame = CreateEngine<BOARD_SIZE>(gameCfg_, config_.temperature, empty, { -1, -1 });
         auto [ax, ay] = currentGame->SearchBestMove();
         currentGame->Play(ax, ay);
         std::cout << "AI opens(black): (" << ax << "," << ay << ")" << std::endl;
@@ -240,7 +255,7 @@ private:
     }
 
 public:
-    explicit GameServer(const ServerConfig& config) : config_(config) {
+    explicit GameServerT(const ServerConfig& config) : config_(config) {
         gameCfg_.model_path = config.model_path;
         gameCfg_.simulate_times = config.simulate_times;
         gameCfg_.c_puct = config.c_puct;
@@ -250,8 +265,9 @@ public:
     }
 
     // 前端拉取默认配置做表单预填
-    void handleGetConfig(crow::json::wvalue& res) {
+    void handleGetConfig(crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
+        res["board_size"] = BOARD_SIZE;
         res["model"] = config_.model_path;
         res["simulate_times"] = gameCfg_.simulate_times;
         res["c_puct"] = gameCfg_.c_puct;
@@ -263,7 +279,7 @@ public:
 
     // 每盘开局: 可选地携带新配置(ai_type/model/simulate_times/c_puct/reuse_states/
     // cores/human_color), 缺省字段沿用当前配置。玩家执白时 AI 先行并返回 ai_move。
-    void handleNewGame(const crow::request& req, crow::json::wvalue& res) {
+    void handleNewGame(const crow::request& req, crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
         if (!req.body.empty()) {
             auto data = json::parse(req.body, nullptr, false);
@@ -328,7 +344,7 @@ public:
         }
     }
 
-    void handleMove(const crow::request& req, crow::json::wvalue& res) {
+    void handleMove(const crow::request& req, crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
 
         auto data = json::parse(req.body);
@@ -351,7 +367,7 @@ public:
                 std::cout << "WARNING: Re-Initializing the game unexpectedly!" << std::endl;
             }
             boardArr[x][y] = gameCfg_.human_color;  // 落上玩家这一手(黑 1 / 白 -1)
-            currentGame = CreateEngine(gameCfg_, config_.temperature, boardArr, std::make_pair(x, y));
+            currentGame = CreateEngine<BOARD_SIZE>(gameCfg_, config_.temperature, boardArr, std::make_pair(x, y));
         } else {
             currentGame->Play(x, y);
         }
@@ -405,7 +421,7 @@ public:
     }
 
     // 沿用当前配置重开一局; 玩家执白时 AI 先行并返回 ai_move
-    void handleRestart(const crow::request& req, crow::json::wvalue& res) {
+    void handleRestart(const crow::request& req, crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
         currentGame.reset();
         res["result"] = "ok";
@@ -414,21 +430,22 @@ public:
         }
     }
 
-    void serveStaticFiles(crow::SimpleApp& app) {
-        // 提供静态文件服务
-        CROW_ROUTE(app, "/")
-        ([]() {
-            crow::mustache::context ctx;
-            return crow::mustache::load("index.html").render();
-        });
-
-        CROW_ROUTE(app, "/<path>")
-        ([](const crow::request& req, crow::response& res, std::string path) {
-            res.set_static_file_info("./templates/" + path);
-            res.end();
-        });
-    }
 };
+
+void ServeStaticFiles(crow::SimpleApp& app) {
+    // 提供静态文件服务
+    CROW_ROUTE(app, "/")
+    ([]() {
+        crow::mustache::context ctx;
+        return crow::mustache::load("index.html").render();
+    });
+
+    CROW_ROUTE(app, "/<path>")
+    ([](const crow::request& req, crow::response& res, std::string path) {
+        res.set_static_file_info("./templates/" + path);
+        res.end();
+    });
+}
 
 void PrintUsage(const char* prog) {
     std::cout
@@ -446,6 +463,7 @@ void PrintUsage(const char* prog) {
         << ", AlphaZero " << DEFAULT_ALPHAZERO_C_PUCT << "\n"
         << "  -c, --cores <n>           搜索线程数, 默认 16\n"
         << "  -p, --port <n>            监听端口, 默认 7000\n"
+        << "  -s, --board-size <n>      棋盘边长, 11 或 15, 默认 " << DEFAULT_BOARD_SIZE << "\n"
         << "      --no-reuse-tree       不复用上一步的搜索树\n"
         << "  -h, --help                打印本帮助\n"
         << "\n"
@@ -498,6 +516,9 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
         } else if (key == "-p" || key == "--port") {
             if (!next_value(i, arg, "--port", value)) return false;
             config.port = std::atoi(value.c_str());
+        } else if (key == "-s" || key == "--board-size") {
+            if (!next_value(i, arg, "--board-size", value)) return false;
+            config.board_size = std::atoi(value.c_str());
         } else if (key == "--no-reuse-tree") {
             config.reuse_tree_states = false;
         } else if (!arg.empty() && arg[0] == '-') {
@@ -525,6 +546,10 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
         std::cerr << "cores must be positive!" << std::endl;
         return false;
     }
+    if (config.board_size != 11 && config.board_size != 15) {
+        std::cerr << "board_size must be 11 or 15 (got " << config.board_size << ")!" << std::endl;
+        return false;
+    }
     if (config.UseModel() && config.temperature <= 0.0f) {
         std::cerr << "temperature must be positive!" << std::endl;
         return false;
@@ -536,7 +561,7 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
 // 解释器走 load_net_any_arch 自动识别 v1(3conv)/v2(ResNet, 推断 blocks/channels)结构
 // 并导出 .pt。与 elo.py 的 prepare_model_path 同一条路径, 行为保持一致。
 // 返回可用的 .pt 路径; 转换失败返回空串。
-std::string ExportToTorchScriptIfNeeded(const std::string& model_path) {
+std::string ExportToTorchScriptIfNeeded(const std::string& model_path, int board_size) {
     if (model_path.size() >= 3 && model_path.substr(model_path.size() - 3) == ".pt") {
         return model_path;
     }
@@ -548,7 +573,7 @@ std::string ExportToTorchScriptIfNeeded(const std::string& model_path) {
         py::module_ sys = py::module_::import("sys");
         sys.attr("path").attr("insert")(0, ".");  // policy_value_net_pytorch_v2 与 web_server 同目录
         py::module_ pv = py::module_::import("policy_value_net_pytorch_v2");
-        py::object net = pv.attr("load_net_any_arch")(BOARD_SIZE, BOARD_SIZE, model_path);
+        py::object net = pv.attr("load_net_any_arch")(board_size, board_size, model_path);
         net.attr("save_model_with_torchscript")(ts_path);
     } catch (const py::error_already_set& e) {
         std::cerr << "Failed to convert model '" << model_path << "': " << e.what() << std::endl;
@@ -560,7 +585,7 @@ std::string ExportToTorchScriptIfNeeded(const std::string& model_path) {
 
 // 提前加载一次模型, 把"模型路径写错/不是 TorchScript 文件"这类问题在启动时就暴露出来,
 // 而不是等到第一次落子搜索时才在工作线程里抛异常。
-bool CheckModel(const std::string& model_path) {
+bool CheckModel(const std::string& model_path, int board_size) {
     std::ifstream fin(model_path, std::ios::binary);
     if (!fin.good()) {
         std::cerr << "Model file not found or unreadable: " << model_path << std::endl;
@@ -570,12 +595,12 @@ bool CheckModel(const std::string& model_path) {
 
     try {
         torch::jit::script::Module module = torch::jit::load(model_path);
-        auto input = torch::zeros({1, 4, BOARD_SIZE, BOARD_SIZE});
+        auto input = torch::zeros({1, 4, board_size, board_size});
         std::vector<torch::jit::IValue> inputs{input};
         auto output_tuple = module.forward(inputs).toTuple();
         auto policy = output_tuple->elements()[0].toTensor();
         auto value = output_tuple->elements()[1].toTensor();
-        if (policy.numel() != BOARD_SIZE * BOARD_SIZE || value.numel() != 1) {
+        if (policy.numel() != board_size * board_size || value.numel() != 1) {
             std::cerr << "Unexpected model output shape: policy numel=" << policy.numel()
                       << ", value numel=" << value.numel() << std::endl;
             return false;
@@ -601,8 +626,8 @@ int main(int argc, char** argv) {
     }
 
     if (config.UseModel()) {
-        config.model_path = ExportToTorchScriptIfNeeded(config.model_path);
-        if (config.model_path.empty() || !CheckModel(config.model_path)) {
+        config.model_path = ExportToTorchScriptIfNeeded(config.model_path, config.board_size);
+        if (config.model_path.empty() || !CheckModel(config.model_path, config.board_size)) {
             return -1;
         }
         std::cout << "AI: AlphaZero(MCTS + policy-value net), model: " << config.model_path
@@ -613,11 +638,19 @@ int main(int argc, char** argv) {
         std::cout << "AI: pure MCTS(model-free), simulate times: " << config.simulate_times
                   << ", c_puct: " << config.c_puct << std::endl;
     }
-    std::cout << "Cores: " << config.cores << ", reuse tree states: "
+    std::cout << "Board size: " << config.board_size << "x" << config.board_size
+              << ", cores: " << config.cores << ", reuse tree states: "
               << (config.reuse_tree_states ? "true" : "false") << std::endl;
 
     crow::SimpleApp app;
-    GameServer server(config);
+    // 棋盘尺寸是搜索树模板的编译期参数, 这里按运行期配置分派
+    std::unique_ptr<IGameServer> server_ptr;
+    if (config.board_size == 11) {
+        server_ptr = std::make_unique<GameServerT<11>>(config);
+    } else {
+        server_ptr = std::make_unique<GameServerT<15>>(config);
+    }
+    IGameServer& server = *server_ptr;
 
     // 设置路由
     CROW_ROUTE(app, "/handle_state")
@@ -652,7 +685,7 @@ int main(int argc, char** argv) {
         });
 
     // 静态文件服务
-    server.serveStaticFiles(app);
+    ServeStaticFiles(app);
 
     // NOTE(junhaozhang): 必须在进入 Crow 事件循环前释放主线程的 GIL!
     // py::initialize_interpreter() 后主线程一直持有 GIL, 若不释放, /new_game 里

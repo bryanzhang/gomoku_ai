@@ -38,6 +38,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--models', required=True,
                         help='逗号分隔的模型路径列表(.model/.ckpt/.pt)')
+    parser.add_argument('--board-size', type=int, default=11, choices=[8, 11, 15],
+                        help='棋盘边长(8/11/15, 与模型的网络输入尺寸一致)')
     parser.add_argument('--games', type=int, default=10,
                         help='每对模型的对局数(建议偶数, 执黑执白各一半)')
     parser.add_argument('--simulations', type=int, default=1000, help='每手 MCTS 模拟次数')
@@ -59,8 +61,8 @@ def main():
     labels = make_labels(model_paths)
     players = []
     for label, path in zip(labels, model_paths):
-        ts_path = prepare_model_path(path, f'league_{label}')
-        players.append(AlphaZeroPlayer(args.simulations, ts_path, args.cores,
+        ts_path = prepare_model_path(path, f'league_{label}', args.board_size, args.board_size)
+        players.append(AlphaZeroPlayer(args.board_size, args.simulations, ts_path, args.cores,
                                        args.c_puct, args.reuse_states))
     print(f'League: {n} models, {args.games} games per pair, '
           f'sims={args.simulations}, c_puct={args.c_puct}, cores={args.cores}, '
@@ -68,7 +70,7 @@ def main():
     for label, path in zip(labels, model_paths):
         print(f'  {label}: {path}', file=sys.stderr)
 
-    game = Game()
+    game = Game(args.board_size, args.board_size)
     # records[i][j] = [胜, 负, 和] (i 的视角, i 对 j); matrix[i][j] = i 从 j 身上拿到的分
     records = [[[0, 0, 0] for _ in range(n)] for _ in range(n)]
     matrix = [[0.0] * n for _ in range(n)]

@@ -4,14 +4,17 @@ import sys
 import numpy as np
 
 class Game:
-    def __init__(self):
-        self.board = np.zeros((11, 11), dtype=np.int32)
+    # board 按 [x][y] 索引(与 player/C++ 侧的 Move=(x,y) 一致), 宽=board_width, 高=board_height
+    def __init__(self, board_width=11, board_height=11):
+        self.board_width = board_width
+        self.board_height = board_height
+        self.board = np.zeros((board_width, board_height), dtype=np.int32)
 
     # 返回赢家和步数
     # NOTE(junhaozhang): 开局必须清空棋盘, 否则连续多局评估时会带着上一局的残局开打。
     # 两个 player 自身的搜索树需要调用方在每局前 reset()。
     def start_play(self, black_player, white_player):
-        self.board = np.zeros((11, 11), dtype=np.int32)
+        self.board = np.zeros((self.board_width, self.board_height), dtype=np.int32)
         players = [ black_player, white_player ]
         last_move = (-1, -1)
         current_player = 0 # 总是黑棋先下
@@ -62,21 +65,21 @@ class Game:
                 if winner != -1:
                     winners_z[np.array(current_players) == winner] = 1.0
                     winners_z[np.array(current_players) != winner] = -1.0
-		#print(f"Steps: {steps}, winner={winner}", file=sys.stderr)
-                self.board = np.zeros((11, 11), dtype=np.int32)
+ 		#print(f"Steps: {steps}, winner={winner}", file=sys.stderr)
+                self.board = np.zeros((self.board_width, self.board_height), dtype=np.int32)
                 player.reset()
                 return winner, zip(states, mcts_probs, winners_z)
             current_player = 1 - current_player
 
     # current_player 0是黑棋，1是白棋
     # NOTE(junhaozhang): 平面必须按 [y][x] 索引, 与 C++ GenModelInputTensor 以及
-    # policy 平铺下标 idx = y * 11 + x 保持一致。self.board 是 [x][y] 索引, 故需转置。
+    # policy 平铺下标 idx = y * W + x 保持一致。self.board 是 [x][y] 索引, 故需转置。
     #   通道0: 当前玩家的棋子位置
     #   通道1: 对手玩家的棋子位置
     #   通道2: 上一步落子位置
     #   通道3: 下一步谁下(黑棋为全1.0)
     def __get_board_input_tensor(self, last_move, current_player):
-        state = np.zeros((4, 11, 11))
+        state = np.zeros((4, self.board_height, self.board_width))
         me = 1 if current_player == 0 else -1  # 棋子编码: 黑棋+1, 白棋-1
         state[0] = (self.board == me).T.astype(np.float64)
         state[1] = (self.board == -me).T.astype(np.float64)

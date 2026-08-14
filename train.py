@@ -19,10 +19,12 @@ import time
 from collections import deque
 
 class TrainPipeline():
-    def __init__(self, init_model=None, game_batch_num=10000, eval_freq=1000, eval_games=20,
+    def __init__(self, init_model=None, board_size=11, n_playout=1000, temp_moves=15,
+                 game_batch_num=10000, eval_freq=1000, eval_games=20,
                  opp_model='', opp_simulations=500000, opp_c_puct=2.0, opp_reuse_states=True):
-        self.board_width = 11
-        self.board_height = 11
+        self.board_width = board_size
+        self.board_height = board_size
+        self.board_size = board_size
         self.n_in_row = 5
         self.game_batch_num = game_batch_num
         self.play_batch_size = 1
@@ -31,26 +33,31 @@ class TrainPipeline():
         self.eval_freq = eval_freq
         self.eval_n_games = eval_games  # 每次评估的对局数, 建议偶数以保证黑白各执一半
         # 自对弈前 temp_moves 手用 temperature=1.0 探索, 之后 τ→0 走最强手
-        self.temp_moves = 15
+        self.temp_moves = temp_moves
         self.save_freq = 10  # 每多少个 batch 落盘一次 checkpoint
-        self.n_playout = 1000
+        self.n_playout = n_playout
         self.kl_targ = 0.02
         self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model)
-        self.game = Game()
-        self.tmp_model_path = "/tmp/gomoku_model.pt"
-        self.ckpt_path = "./current_policy.ckpt"
+        self.game = Game(self.board_width, self.board_height)
+        # 所有落盘/临时路径都带棋盘尺寸后缀(11x11 保持历史路径不变),
+        # 防止不同尺寸的训练任务互相覆盖 checkpoint、抢同一个 torchscript 临时文件。
+        suffix = "" if board_size == 11 else f"_{board_size}x{board_size}"
+        self.tmp_model_path = f"/tmp/gomoku_model{suffix}.pt"
+        self.ckpt_path = f"./current_policy{suffix}.ckpt"
+        self.model_path = f"./current_policy{suffix}.model"
+        self.log_dir = f"./gomoku_experiments{suffix}"
         # 评估(类似 elo.py): 与固定对手交替执黑对弈, 只记录指标(overall/black/white
         # score, avg steps), 不做早停或选模。对手默认 model-free 纯 MCTS;
         # opp_model 非空(.model/.ckpt/.pt)时加载为 AlphaZero 对手。
-        self.eval_cur_ts_path = "/tmp/gomoku_model_eval_cur.pt"  # 当前版本 torchscript
+        self.eval_cur_ts_path = f"/tmp/gomoku_model_eval_cur{suffix}.pt"  # 当前版本 torchscript
         self.opp_model = opp_model
         self.opp_simulations = opp_simulations
         self.opp_c_puct = opp_c_puct
         self.opp_reuse_states = opp_reuse_states
         self.eval_opp_player = None  # 首次评估时构建, 之后复用(对手不随训练变化)
         # 每次评估时把当时的模型存一份快照, 训练完后可任意挑选用于测试
-        self.eval_snapshot_dir = "./eval_snapshots"
-        self.mcts_player = AlphaZeroPlayer(self.n_playout, self.tmp_model_path, 16, 5.0, True)
+        self.eval_snapshot_dir = f"./{board_size}x{board_size}_snapshots"
+        self.mcts_player = AlphaZeroPlayer(board_size, self.n_playout, self.tmp_model_path, 16, 5.0, True)
         # v4 路线图第 2 步: buffer 10000 -> 50000。8 倍增广后每局 ~400 条, 10000 只装
         # ~25 局, 网络一直在"最近 25 局"上原地踏步; 50000 约 125 局窗口(~250MB 内存)。
         self.data_buffer = deque(maxlen=10000)
@@ -99,7 +106,7 @@ class TrainPipeline():
         if not self.opp_model:
             desc = (f"PureMCTS(sims={self.opp_simulations}, c_puct={self.opp_c_puct}, "
                     f"reuse_states={self.opp_reuse_states})")
-            return PureMCTSPlayer(self.opp_simulations, 16, self.opp_c_puct,
+            return PureMCTSPlayer(self.board_size, self.opp_simulations, 16, self.opp_c_puct,
                                   self.opp_reuse_states), desc
         ts_path = self.opp_model
         if not ts_path.endswith('.pt'):
@@ -110,7 +117,7 @@ class TrainPipeline():
             print(f"[Eval] exported opponent torchscript {self.opp_model} -> {ts_path}", file=sys.stderr)
         desc = (f"AlphaZero(model={self.opp_model}, sims={self.opp_simulations}, "
                 f"c_puct={self.opp_c_puct}, reuse_states={self.opp_reuse_states})")
-        return AlphaZeroPlayer(self.opp_simulations, ts_path, 16, self.opp_c_puct,
+        return AlphaZeroPlayer(self.board_size, self.opp_simulations, ts_path, 16, self.opp_c_puct,
                                self.opp_reuse_states), desc
 
     # 固定对手评估(类似 elo.py): 当前模型与对手交替执黑, 各执黑一半局数。
@@ -120,14 +127,14 @@ class TrainPipeline():
         # NOTE(junhaozhang): 必须用独立的 Game 实例! start_self_play 依赖 self.game 的
         # 棋盘在上局结束时是空的, 若评估复用 self.game, 评估终局会残留在棋盘上,
         # 导致下一次自对弈第一手 StateEquals 失配。
-        eval_game = Game()
+        eval_game = Game(self.board_width, self.board_height)
         # 保存当时模型的快照(state_dict), 与本次评估所见权重一致, 便于事后挑选测试
         os.makedirs(self.eval_snapshot_dir, exist_ok=True)
         snapshot_path = os.path.join(self.eval_snapshot_dir, f'policy_game_{games_played}.model')
         self.policy_value_net.save_model(snapshot_path)
         # 当前模型每次评估都要重新导出(权重在训练中不断变化)
         self.policy_value_net.save_model_with_torchscript(self.eval_cur_ts_path)
-        current_player = AlphaZeroPlayer(self.n_playout, self.eval_cur_ts_path, 16, 5.0, True)
+        current_player = AlphaZeroPlayer(self.board_size, self.n_playout, self.eval_cur_ts_path, 16, 5.0, True)
         if self.eval_opp_player is None:
             self.eval_opp_player, self.eval_opp_desc = self.build_eval_opponent()
             print(f"[Eval] opponent: {self.eval_opp_desc}", file=sys.stderr)
@@ -195,11 +202,11 @@ class TrainPipeline():
         self.policy_value_net.save_checkpoint(self.ckpt_path,
                                               batch=batch_no + 1,
                                               lr_multiplier=self.lr_multiplier)
-        self.policy_value_net.save_model('./current_policy.model')
+        self.policy_value_net.save_model(self.model_path)
         print(f"Checkpoint saved at batch {batch_no + 1} -> {self.ckpt_path}", file=sys.stderr)
 
     def run(self):
-        writer = SummaryWriter("./gomoku_experiments")
+        writer = SummaryWriter(self.log_dir)
         i = self.start_batch
         try:
             for i in range(self.start_batch, self.game_batch_num):
@@ -230,6 +237,13 @@ if __name__ == '__main__':
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('init_model', nargs='?', default=None,
                         help='初始模型(.model/.ckpt), 缺省从零开始训练')
+    parser.add_argument('--board-size', type=int, default=11, choices=[8, 11, 15],
+                        help='棋盘边长(8/11/15, 对应 gomoku_ai 的 C++ 绑定); 15x15 的 checkpoint/'
+                             '快照/tensorboard 目录会自动带 _15x15 后缀, 不会覆盖 11x11 的产物')
+    parser.add_argument('--n-playout', type=int, default=1000,
+                        help='自对弈与评估时当前模型每手的 MCTS 模拟次数')
+    parser.add_argument('--temp-moves', type=int, default=15,
+                        help='自对弈前 N 手用 temperature=1.0 探索, 之后 τ→0 走最强手')
     parser.add_argument('--games', type=int, default=10000, help='总自对弈局数')
     parser.add_argument('--eval-freq', type=int, default=1000, help='每隔多少局评估一次')
     parser.add_argument('--eval-games', type=int, default=20,
@@ -243,6 +257,9 @@ if __name__ == '__main__':
                         help='评估对手是否复用搜索树')
     args = parser.parse_args()
     training_pipeline = TrainPipeline(init_model=args.init_model,
+                                      board_size=args.board_size,
+                                      n_playout=args.n_playout,
+                                      temp_moves=args.temp_moves,
                                       game_batch_num=args.games,
                                       eval_freq=args.eval_freq,
                                       eval_games=args.eval_games,
