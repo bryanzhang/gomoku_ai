@@ -21,7 +21,8 @@ from collections import deque
 class TrainPipeline():
     def __init__(self, init_model=None, board_size=11, n_playout=1000, temp_moves=15,
                  game_batch_num=10000, eval_freq=1000, eval_games=20,
-                 opp_model='', opp_simulations=500000, opp_c_puct=2.0, opp_reuse_states=True):
+                 opp_model='', opp_simulations=500000, opp_c_puct=2.0, opp_reuse_states=True,
+                 num_blocks=3, channels=64):
         self.board_width = board_size
         self.board_height = board_size
         self.board_size = board_size
@@ -37,7 +38,8 @@ class TrainPipeline():
         self.save_freq = 10  # 每多少个 batch 落盘一次 checkpoint
         self.n_playout = n_playout
         self.kl_targ = 0.02
-        self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model)
+        self.policy_value_net = PolicyValueNet(self.board_width, self.board_height, model_file=init_model,
+                                               num_blocks=num_blocks, channels=channels)
         self.game = Game(self.board_width, self.board_height)
         # 所有落盘/临时路径都带棋盘尺寸后缀(11x11 保持历史路径不变),
         # 防止不同尺寸的训练任务互相覆盖 checkpoint、抢同一个 torchscript 临时文件。
@@ -240,6 +242,10 @@ if __name__ == '__main__':
     parser.add_argument('--board-size', type=int, default=11, choices=[8, 11, 15],
                         help='棋盘边长(8/11/15, 对应 gomoku_ai 的 C++ 绑定); 15x15 的 checkpoint/'
                              '快照/tensorboard 目录会自动带 _15x15 后缀, 不会覆盖 11x11 的产物')
+    parser.add_argument('--num-blocks', type=int, default=3,
+                        help='策略值网络(v2 ResNet)的残差块数, 大棋盘可适当加大')
+    parser.add_argument('--channels', type=int, default=64,
+                        help='策略值网络(v2 ResNet)的通道数, 大棋盘可适当加大')
     parser.add_argument('--n-playout', type=int, default=1000,
                         help='自对弈与评估时当前模型每手的 MCTS 模拟次数')
     parser.add_argument('--temp-moves', type=int, default=15,
@@ -266,5 +272,7 @@ if __name__ == '__main__':
                                       opp_model=args.opp_model,
                                       opp_simulations=args.opp_simulations,
                                       opp_c_puct=args.opp_c_puct,
-                                      opp_reuse_states=args.opp_reuse_states)
+                                      opp_reuse_states=args.opp_reuse_states,
+                                      num_blocks=args.num_blocks,
+                                      channels=args.channels)
     training_pipeline.run()
