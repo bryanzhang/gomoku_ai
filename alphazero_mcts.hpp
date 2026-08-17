@@ -18,10 +18,12 @@
 #include <torch/script.h>
 #include <ATen/Parallel.h>
 
-// 不显式包含 omp.h 以避免引入 OpenMP 编译参数; libgomp 由 torch 带入进程,
-// 链接时加 -lgomp 即可解析(见 setup.py)。
-// 注意: 不要在这里加 mkl_set_num_threads_local —— 在从未初始化过 MKL TLS 的
-// worker 线程上首调它会段错误(实测); 若确有需要, 必须在首条 MKL 算子之后调。
+// Deliberately do NOT include omp.h to avoid pulling in OpenMP compile
+// flags; libgomp is already loaded into the process by torch, so linking
+// with -lgomp is enough to resolve the symbol (see setup.py).
+// Note: do NOT call mkl_set_num_threads_local here -- calling it first on a
+// worker thread whose MKL TLS was never initialized segfaults (observed);
+// if ever needed, it must be called after the first MKL op on that thread.
 extern "C" void omp_set_num_threads(int);
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
@@ -37,13 +39,14 @@ void softmax_inplace(std::vector<double>& input) {
     double max_val = *std::max_element(input.begin(), input.end());
     double sum = 0.0;
 
-    // 计算指数并求和，同时确保数值稳定性
+    // Compute exponentials and their sum, with the max subtracted for
+    // numerical stability.
     for (size_t i = 0; i < input.size(); ++i) {
         input[i] = std::exp(input[i] - max_val);
         sum += input[i];
     }
 
-    // 归一化
+    // Normalize
     for (size_t i = 0; i < input.size(); ++i) {
         input[i] /= sum;
     }
@@ -110,18 +113,18 @@ inline std::string format(const char* fmt, ...) {
     va_list args;
     
     va_start(args, fmt);
-    int length = vsnprintf(nullptr, 0, fmt, args); // C++11 标准规定，若buf为nullptr且size为0，则返回所需字节数（不含空终止符）
+    int length = vsnprintf(nullptr, 0, fmt, args); // per C++11, if buf is nullptr and size is 0, returns the number of bytes needed (excluding the null terminator)
     va_end(args);
     
     if (length <= 0) {
-        return ""; // 格式化错误，返回空字符串
+        return ""; // formatting error: return an empty string
     }
     
     size_t buf_size = length + 1;
     std::vector<char> buf(buf_size);
     
     va_start(args, fmt);
-    vsnprintf(buf.data(), buf_size, fmt, args); // 使用vector的data()成员函数获取裸指针
+    vsnprintf(buf.data(), buf_size, fmt, args); // use the vector's data() member to get the raw pointer
     va_end(args);
     
     return std::string(buf.data());
@@ -132,7 +135,7 @@ template <class TYPE>
 struct HPRecType {
    std::atomic<HPRecType<TYPE>*> next_ = nullptr;
    std::atomic<bool> active_ = false;
-   std::atomic<TYPE*> hazard_ = nullptr;  // NOTE(junhaozhang): 并不own!
+   std::atomic<TYPE*> hazard_ = nullptr;  // NOTE(junhaozhang): not owned!
 
    void Release() {
         hazard_ = nullptr;
@@ -157,13 +160,17 @@ public:
 
     HPRecType<TYPE>* Acquire() {
        HPRecType<TYPE>* p = head_;
-       for (; p; p = p->next_.load()) {
-           // NOTE(junhaozhang): expected 必须在每次迭代内重置! CAS 失败会把 expected
-           // 改写成当前值(true); 不重置的话, 下一轮 CAS 拿 true 去比较别人的活跃 rec
-           // 会"成功"返回 —— 两个线程共享同一 HP rec, hazard 保护失效, 退休的
-           // children vector 被提前回收, 读到野指针后在 uniform_int_distribution(0,-1)
-           // 上无限递归爆栈(8000 局训练的 core 实锤)。
-           bool expected_false = false;
+        for (; p; p = p->next_.load()) {
+            // NOTE(junhaozhang): expected must be reset on every iteration!
+            // A failed CAS overwrites expected with the current value (true);
+            // without resetting, the next CAS would compare true against
+            // someone else's active rec and "succeed" -- two threads would
+            // share one HP rec, hazard protection breaks, a retired children
+            // vector gets reclaimed early, and the wild-pointer read recurses
+            // forever inside uniform_int_distribution(0,-1) until the stack
+            // blows up (confirmed by a core dump from an 8000-game training
+            // run).
+            bool expected_false = false;
            if (!p->active_.compare_exchange_strong(expected_false, true)) {
                continue;
            }
@@ -285,11 +292,16 @@ class ThreadLocalModels {
 public:
     ThreadLocalModels(const char* model_path) : model_path_(model_path) {}
 
-    // 跨"手"复用的全局模型缓存: 同一 model_path 且文件未变(mtime+size)时复用线程局部
-    // 模型; 文件变化(如自对弈每局重写 .pt)时整体重建。否则每手棋 16 个线程都要各
-    // torch::jit::load 一次(单份 load+首次前向 27~57ms, x16线程 x~50手 ≈ 22~45s/局)。
-    // NOTE(junhaozhang): registry 用泄漏式堆对象, 进程退出时不析构 torch 模块, 避免
-    // torch 运行时先析构导致的 exit crash; 中途替换发生在 torch 存活期, 安全。
+    // Global model cache reused across moves: when the same model_path is
+    // unchanged (mtime+size), reuse the thread-local models; when the file
+    // changes (e.g. self-play rewrites the .pt after every game), rebuild the
+    // whole thing. Otherwise every move would make each of the N worker
+    // threads torch::jit::load once (one load + first forward takes
+    // 27~57ms; x N threads x ~50 moves ~ tens of seconds per game).
+    // NOTE(junhaozhang): the registry is a deliberately leaked heap object so
+    // that torch modules are never destructed at process exit, avoiding an
+    // exit crash when the torch runtime is torn down first; mid-process
+    // replacement happens while torch is alive and is safe.
     static ThreadLocalModels& Get(const char* model_path) {
         struct stat st;
         uint64_t mtime_ns = 0, fsize = 0;
@@ -307,9 +319,11 @@ public:
         return *entry.models;
     }
 
-    // NOTE(junhaozhang): torch::jit::load 抛出的 c10::Error 在 folly worker 里无法
-    // 安全回传( unwind 时直接 abort 整个进程, 实测), 所以这里对"模型文件正被替换/
-    // 暂时不可读"做有限退避重试; 只有彻底失败才把异常抛出去。
+    // NOTE(junhaozhang): the c10::Error thrown by torch::jit::load cannot
+    // propagate safely out of a folly worker (unwinding aborts the whole
+    // process, observed in practice), so here we do a limited backoff-retry
+    // for "model file is being replaced / temporarily unreadable"; the
+    // exception is rethrown only after all retries are exhausted.
     static torch::jit::script::Module LoadWithRetry(const std::string& path, int max_retries = 100) {
         for (int attempt = 0; ; ++attempt) {
             try {
@@ -349,7 +363,7 @@ private:
         uint64_t fsize = 0;
     };
     static std::map<std::string, Entry>& Registry() {
-        static auto* registry = new std::map<std::string, Entry>();  // 故意泄漏, 见 Get 注释
+        static auto* registry = new std::map<std::string, Entry>();  // deliberately leaked; see the comment on Get
         return *registry;
     }
     static std::mutex& RegistryMutex() {
@@ -363,14 +377,14 @@ private:
 
 template <int BOARD_SIZE, bool WITH_PRIOR_P, bool WITH_VIRTUAL_LOSS = false>
 struct TreeNode {
-    // 多线程不变部分
+    // Parts that are immutable under multithreading
     TreeNode* parent_;
     std::bitset<BOARD_SIZE * BOARD_SIZE> availables_;
     std::bitset<BOARD_SIZE * BOARD_SIZE> blacks_;
 
-    // 多线程易变部分
-    std::atomic<uint64_t> children_;  // 最高两字节为计数值，避免ABA问题
-    std::atomic<uint64_t> concurrency_visits_score_ = 0;  // 最高1字节代表节点的当前线程并发数量(concurrency), 接着三字节为visits，最低4字节为score
+    // Parts that are mutable under multithreading
+    std::atomic<uint64_t> children_;  // the top two bytes hold a counter to avoid the ABA problem
+    std::atomic<uint64_t> concurrency_visits_score_ = 0;  // top 1 byte: number of threads currently inside the node (concurrency), next 3 bytes: visits, lowest 4 bytes: score
     std::conditional_t<WITH_PRIOR_P == true, float, std::monostate> p_;  // prior probability
 
     template <bool T = WITH_PRIOR_P, typename std::enable_if_t<!T, bool> = true>
@@ -400,7 +414,7 @@ struct TreeNode {
     }
 
     ~TreeNode() {
-        // 不管parent的内存
+        // parent's memory is not managed here
         std::vector<uint64_t>* children = (std::vector<uint64_t>*)(children_ & 0x0000ffffffffffff);
         // std::cerr << format("Reclaim %zu children entries!\n", children->size());
         for (auto itr = children->begin(); itr != children->end(); ++itr) {
@@ -431,7 +445,7 @@ struct TreeNode {
         solid &= not_available;
         int idx = last_move.second * BOARD_SIZE + last_move.first;
 
-        // 横向
+        // Horizontal
         int diff_begin = 0;
         while (last_move.first - diff_begin >= 0 && solid[idx - diff_begin]) { ++diff_begin; }
         int diff_end = 0;
@@ -440,7 +454,7 @@ struct TreeNode {
             return true;
         }
 
-        // 竖向
+        // Vertical
         diff_begin = 0;
         while (last_move.second - diff_begin >= 0 && solid[idx - diff_begin * BOARD_SIZE]) { ++diff_begin; }
         diff_end = 0;
@@ -449,7 +463,7 @@ struct TreeNode {
             return true;
         }
 
-        // 斜向1
+        // Diagonal '\'
         diff_begin = 0;
         while (last_move.first - diff_begin >= 0 && last_move.second - diff_begin >= 0 && solid[idx - diff_begin * (BOARD_SIZE + 1)]) { ++diff_begin; }
         diff_end = 0;
@@ -458,7 +472,7 @@ struct TreeNode {
             return true;
         }
 
-        // 斜向2
+        // Diagonal '/'
         diff_begin = 0;
         while (last_move.first - diff_begin >= 0 && last_move.second + diff_begin < BOARD_SIZE && solid[idx + diff_begin * (BOARD_SIZE - 1)]) { ++diff_begin; }
         diff_end = 0;
@@ -470,7 +484,7 @@ struct TreeNode {
         return false;
     }        
 
-    // 增加1个concurrency
+    // Increment concurrency by 1
     uint64_t WeakLock() {
         uint64_t old_value, new_value;
         do {
@@ -482,13 +496,13 @@ struct TreeNode {
     }
 
     void GenModelInputTensor(torch::Tensor& input_tensor, Move& last_move, bool is_last_black) {
-        // NOTE(jhzhang03): 假定input_tensor为全0了
-        // 通道1: 当前玩家的棋子位置
-        // 通道2: 对手玩家的棋子位置
-        // 通道3: 上一步落子位置
-        // 通道4: 下一步谁下(黑棋为1.0)
+        // NOTE(jhzhang03): assumes input_tensor is all zeros
+        // channel 1: current player's stones
+        // channel 2: opponent's stones
+        // channel 3: last move position
+        // channel 4: side to move (1.0 if black is next)
         auto accessor = input_tensor.accessor<float, 4>();
-        if (!is_last_black) {  // 下一步玩家为黑棋
+        if (!is_last_black) {  // black plays next
             for (int x = 0; x < BOARD_SIZE; ++x) {
                 for (int y = 0; y <BOARD_SIZE; ++y) {
                     int idx = y * BOARD_SIZE + x;
@@ -497,8 +511,10 @@ struct TreeNode {
                     } else if (!availables_[idx]) {
                         accessor[0][1][y][x] = 1.0;
                     }
-                    // NOTE(junhaozhang): 通道4表示"下一步是否黑棋走", 必须整片填1.0,
-                    // 而不是只填空点, 否则与 Python 侧 game.py 的训练输入不一致。
+                    // NOTE(junhaozhang): channel 4 means "black moves next"
+                    // and must be filled with 1.0 across the whole plane, not
+                    // just the empty points, otherwise it mismatches the
+                    // training input produced by game.py on the Python side.
                     accessor[0][3][y][x] = 1.0;
                 }
             }
@@ -703,8 +719,10 @@ struct TreeNode {
             float scores;
             std::memcpy(&scores, &old_value, sizeof(scores));
             scores += score;
-            // NOTE(junhaozhang): memcpy 只写低32位, 必须先清零高32位再 OR,
-            // 否则 new_value 的高位是未初始化数据/上一轮 CAS 的残留, 会污染 visits 与 concurrency。
+            // NOTE(junhaozhang): memcpy only writes the low 32 bits; the high
+            // 32 bits must be zeroed before the OR, otherwise they contain
+            // uninitialized data / residue from the previous CAS round and
+            // would corrupt visits and concurrency.
             new_value = 0;
             std::memcpy(&new_value, &scores, sizeof(scores));
             new_value |= ((uint64_t)concurrency << 56);
@@ -751,13 +769,13 @@ public:
         }
         if (last_move_.first < 0 || last_move_.second < 0) {
             if (root_->availables_.count() != BOARD_SIZE * BOARD_SIZE) {
-                throw std::runtime_error(format("NO last action but there are %d picies on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
+                throw std::runtime_error(format("NO last action but there are %d pieces on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
             }
-            is_last_black_ = false;  // 强要求黑棋先走
+            is_last_black_ = false;  // black is strictly required to move first
         } else {
             int index = last_move_.second * BOARD_SIZE + last_move_.first;
             if (root_->availables_[index]) {
-                throw std::runtime_error(format("The move(%d,%d) hasnot been made!", last_move.first, last_move.second));
+                throw std::runtime_error(format("The move(%d,%d) has not been made!", last_move.first, last_move.second));
             }
             is_last_black_ = root_->blacks_[index];
         }
@@ -787,13 +805,13 @@ public:
         }
         if (last_move_.first < 0 || last_move_.second < 0) {
             if (root_->availables_.count() != BOARD_SIZE * BOARD_SIZE) {
-                throw std::runtime_error(format("NO last action but there are %d picies on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
+                throw std::runtime_error(format("NO last action but there are %d pieces on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
             }
-            is_last_black_ = false;  // 强要求黑棋先走
+            is_last_black_ = false;  // black is strictly required to move first
         } else {
             int index = last_move_.second * BOARD_SIZE + last_move_.first;
             if (root_->availables_[index]) {
-                throw std::runtime_error(format("The move(%d,%d) hasnot been made!", last_move.first, last_move.second));
+                throw std::runtime_error(format("The move(%d,%d) has not been made!", last_move.first, last_move.second));
             }
             is_last_black_ = root_->blacks_[index];
         }
@@ -804,10 +822,14 @@ public:
         delete root_;
     }
 
-    // 清空搜索树回到空棋盘开局状态(等价于重建 Framework), 但保留线程池不重建:
-    // 线程 id 不变, ThreadLocalModels 里按 thread id 缓存的模型可跨局复用。
-    // NOTE(junhaozhang): 若每局新建 Framework, 新线程池的新 thread id 会让
-    // ThreadLocalModels::models_ 每局永久多缓存 cores 份 torch 模块(内存随局数泄漏)。
+    // Clear the search tree back to the empty-board opening state
+    // (equivalent to rebuilding the Framework), but keep the thread pool:
+    // thread ids stay the same, so the models cached by thread id in
+    // ThreadLocalModels can be reused across games.
+    // NOTE(junhaozhang): if a new Framework were created per game, the new
+    // thread pool's new thread ids would make ThreadLocalModels::models_
+    // permanently cache `cores` extra torch modules per game (memory leaks
+    // with the number of games).
     void Reset() {
         delete root_;
         root_ = new TreeNode<BOARD_SIZE, WITH_MODEL>();
@@ -887,7 +909,7 @@ std::cerr << "Last black not equal!" << std::endl;
         TreeNode<BOARD_SIZE, WITH_MODEL>* new_root = nullptr;
         int child_idx = y * BOARD_SIZE + x;
         if (!root_->availables_[child_idx]) {
-            throw std::runtime_error(format("(%d,%d) is not avialable!", x, y));
+            throw std::runtime_error(format("(%d,%d) is not available!", x, y));
         }
         if (!reuse_tree_states_) {
             new_root = new TreeNode<BOARD_SIZE, WITH_MODEL>(root_, child_idx, !is_last_black_);
@@ -927,7 +949,7 @@ std::cerr << "Last black not equal!" << std::endl;
         return root_->IsEnd(last_move_, is_last_black_);
     }
 
-    // 返回所有可落子位置及对应概率值
+    // Return all legal moves and their probabilities
     template <bool W = WITH_MODEL>
     std::enable_if_t<W, std::pair<std::vector<int>, std::vector<double>>> SearchBestMoveWithModel(int simulate_times, const char* model_path, float temperature) {
         std::vector<int> sensible_moves;
@@ -941,7 +963,7 @@ std::cerr << "Last black not equal!" << std::endl;
         HPList<std::vector<uint64_t>> hp_list(100);
         MTRetireLists<std::vector<uint64_t>> retire_lists;
 
-        auto& models = ThreadLocalModels::Get(model_path);  // 跨手复用, 文件变化才 reload
+        auto& models = ThreadLocalModels::Get(model_path);  // reused across moves; reload only when the file changes
         MakeAllVisible();
         std::vector<folly::Future<folly::Unit>> futures;
         for (int i = 0; i < simulate_times; ++i) {
@@ -1054,7 +1076,7 @@ std::cerr << "Last black not equal!" << std::endl;
             rd(),
             static_cast<unsigned int>(std::chrono::steady_clock::now().time_since_epoch().count()),
             static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id())),
-            static_cast<unsigned int>(task_idx)  // 使用任务索引增加随机性        };
+            static_cast<unsigned int>(task_idx)  // use the task index for extra randomness        };
     */
         thread_local std::mt19937 engine(rd());
         return engine;
@@ -1093,13 +1115,19 @@ std::cerr << "Last black not equal!" << std::endl;
 
     template <bool T = WITH_MODEL, typename std::enable_if_t<T, bool> = true>
     void RolloutWithModel(ThreadLocalModels& models, HPList<std::vector<uint64_t>>& hp_list, std::atomic<int>& finished_count, int task_idx, MTRetireLists<std::vector<uint64_t>>& retire_lists) {
-        // NOTE(junhaozhang): 前向的 intra-op OMP 并行默认开满核数, 16 个 worker x 16 个
-        // OMP 线程在 16 核上互相抢占, 实测 1000 sims 从 ~250ms 劣化到 ~1300ms(5x+)。
-        // 小网络单次前向的算子同步开销远大于计算, 必须由 worker 级并行独占核。
-        // 两个开关都是 thread-local, 只影响本 worker, 不影响 Python 主线程训练的
-        // 批量算子: at::set_num_threads 管 ATen 自身并行; omp_set_num_threads 管
-        // THNN slow_conv2d 的 unfolded2d_copy_kernel 裸 OMP region(gdb 实测 conv
-        // 走的是这条路而非 oneDNN, 该 kernel 不读 ATen 的线程数设置)。
+        // NOTE(junhaozhang): intra-op OMP parallelism of the forward pass
+        // defaults to using all cores; N workers x N OMP threads preempt each
+        // other on an N-core box, and measured 1000 sims degrade from ~250ms
+        // to ~1300ms (5x+). For a small network, per-forward op
+        // synchronization costs far more than the compute, so worker-level
+        // parallelism must own the cores exclusively.
+        // Both switches are thread-local and affect only this worker, not the
+        // batched ops of training on the Python main thread:
+        // at::set_num_threads governs ATen's own parallelism;
+        // omp_set_num_threads governs the raw OMP region of THNN
+        // slow_conv2d's unfolded2d_copy_kernel (gdb shows conv takes this
+        // path rather than oneDNN, and that kernel does not read ATen's
+        // thread-count setting).
         thread_local bool intraop_threads_set = false;
         if (!intraop_threads_set) {
             at::set_num_threads(1);
@@ -1132,9 +1160,12 @@ std::cerr << "Last black not equal!" << std::endl;
 
         auto& model = models.GetThreadLocalModel();
         std::map<int, float> act_probs;
-        // NOTE(junhaozhang): 本仓库的约定是"节点存的分数 = 走进该节点的那一方的视角"
-        // (见 pure_mcts.hpp 终局记 +1, 且 SelectAndExpand 对子节点取 max)。
-        // 终局时走进 node 的一方获胜, 故 score = 1.0。
+        // NOTE(junhaozhang): this repo's convention is "the score stored in a
+        // node is from the perspective of the side that moved INTO the node"
+        // (see pure_mcts.hpp scoring +1 at a terminal node, and
+        // SelectAndExpand taking max over children).
+        // At a terminal node the side that moved into `node` wins, hence
+        // score = 1.0.
         float score = 1.0;
         if (!node->IsEnd(last_move, is_last_black)) {
             // std::cerr << "NOT IsEnd!\n";
@@ -1150,7 +1181,9 @@ std::cerr << "Last black not equal!" << std::endl;
             // std::cerr << "Getting output 1\n";
             auto policy_output = output_tuple->elements()[0].toTensor().accessor<float, 2>();
             // std::cerr << "Getting output 2\n";
-            // value head 输出的是"该状态待走方"的视角, 与本节点存分的视角相反, 必须取负。
+            // The value head outputs the perspective of "the side to move at
+            // that state", which is opposite to the perspective of the score
+            // stored in this node, so it must be negated.
             score = -output_tuple->elements()[1].toTensor().accessor<float, 2>()[0][0];
             for (int x = 0; x < BOARD_SIZE; ++x) {
                 for (int y = 0; y <BOARD_SIZE; ++y) {

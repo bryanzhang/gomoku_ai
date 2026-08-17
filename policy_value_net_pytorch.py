@@ -63,7 +63,8 @@ class PolicyValueNet():
         if model_file:
             self.load_model(model_file)
 
-    # 既支持纯 state_dict, 也支持 save_checkpoint 产出的完整 checkpoint
+    # Supports both a plain state_dict and a full checkpoint produced by
+    # save_checkpoint.
     def load_model(self, model_file):
         ckpt = torch.load(model_file, map_location='cpu')
         if isinstance(ckpt, dict) and 'net' in ckpt:
@@ -100,29 +101,39 @@ class PolicyValueNet():
         entropy = -torch.mean(torch.sum(torch.exp(log_act_probs) * log_act_probs, 1))
         return loss.item(), entropy.item()
 
-    # 导出用的网络: v1 无 BN, 直接用训练网络本身(trace 与源共享参数存储, 权重更新
-    # 自动生效)。v2 带 BN, 会覆盖为"BN 折叠进 conv 的副本"(等效 torch.jit.freeze)。
+    # Network used for export: v1 has no BN, so the training net itself is
+    # used (the trace shares parameter storage with the source, so weight
+    # updates take effect automatically). v2 has BN and overrides this with a
+    # "BN folded into conv" copy (equivalent to torch.jit.freeze).
     def _build_export_net(self):
         return self.policy_value_net
 
-    # 每次导出前把训练权重同步进导出网络; v1 共享存储, 无需任何操作
+    # Sync training weights into the export net before each export; v1 shares
+    # storage, so this is a no-op.
     def _refresh_export_net(self):
         pass
 
     # for cpp-usage
     def save_model_with_torchscript(self, model_file):
-        # NOTE(junhaozhang): torch.jit.trace/freeze 每调一次会泄漏数 MB C++ 内存
-        # (torch 2.8 实测, gc.collect 无效), 训练一局一导出、几千局累计十几 GB 会 OOM。
-        # 因此 trace 只在首次导出时做一次, 之后复用同一 traced 模块(其参数与导出网络
-        # 共享存储, 实测权重更新自动可见); BN 折叠改由 _build_export_net 在 Python 侧
-        # 手工完成(v2), 效果等同 freeze 但不反复泄漏。
+        # NOTE(junhaozhang): every torch.jit.trace/freeze call leaks several
+        # MB of C++ memory (measured on torch 2.8; gc.collect does not help),
+        # and exporting once per game over thousands of games accumulates to
+        # tens of GB -> OOM. So trace only once at the first export and reuse
+        # the same traced module afterwards (its parameters share storage
+        # with the export net, and weight updates are visible automatically);
+        # BN folding is instead done manually on the Python side by
+        # _build_export_net (v2), which is equivalent to freeze but does not
+        # leak repeatedly.
         if getattr(self, '_export_traced', None) is None:
             example_input = torch.randn(1, 4, self.board_width, self.board_height)
             self._export_traced = torch.jit.trace(self._build_export_net(), example_input)
         self._refresh_export_net()
-        # NOTE(junhaozhang): 必须原子写! C++ 侧 ThreadLocalModels 靠 mtime 侦测模型更新
-        # 并即时 reload; 直接覆写会让 worker 读到写一半的文件, torch::jit::load 抛出的
-        # c10::Error 在 folly worker 里无法安全回传, 会直接 abort 整个进程(实测)。
+        # NOTE(junhaozhang): the write must be atomic! The C++ side
+        # ThreadLocalModels detects model updates by mtime and reloads
+        # immediately; overwriting in place would let a worker read a
+        # half-written file, and the c10::Error raised by torch::jit::load
+        # cannot propagate safely out of a folly worker -- it aborts the
+        # whole process (observed in practice).
         tmp_file = model_file + '.tmp'
         self._export_traced.save(tmp_file)
         os.replace(tmp_file, model_file)
@@ -134,11 +145,12 @@ class PolicyValueNet():
         net_params = self.get_policy_param() # get model params
         torch.save(net_params, model_file)
 
-    # 完整 checkpoint: 网络权重 + optimizer 状态 + 训练进度, 用于续训
+    # Full checkpoint: net weights + optimizer state + training progress, for
+    # resuming training.
     def save_checkpoint(self, ckpt_file, **extra):
         ckpt = {'net': self.policy_value_net.state_dict(),
                 'opt': self.optimizer.state_dict()}
         ckpt.update(extra)
         tmp_file = ckpt_file + '.tmp'
         torch.save(ckpt, tmp_file)
-        os.replace(tmp_file, ckpt_file)  # 原子替换, 避免写一半被中断导致 checkpoint 损坏
+        os.replace(tmp_file, ckpt_file)  # atomic replace, so an interrupted write cannot corrupt the checkpoint

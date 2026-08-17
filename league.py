@@ -1,27 +1,32 @@
 #! /usr/bin/python3
 
-# 模型循环联赛(round-robin): 每对模型对打若干局(执黑执白各一半),
-# 结束输出总积分排名(赢+1, 和+0.5, 输+0)与两两对战得分矩阵。
+# Round-robin league between models: each pair plays several games (half as
+# black, half as white). At the end, print the total-score ranking
+# (win +1, draw +0.5, loss +0) and the pairwise score matrix.
 #
-# 示例:
-#   ./league.py --models=a.model,b.model,c.model                  # 默认每对 10 局
+# Examples:
+#   ./league.py --models=a.model,b.model,c.model                  # 10 games per pair by default
 #   ./league.py --models=a.model,./eval_snapshots/policy_game_5000.model \
 #               --games=20 --simulations=2000 --c-puct=4.0
 
 import argparse
+import os
 import sys
 import time
 from collections import defaultdict
 
-# 复用 elo.py 的模型装载逻辑: .pt 直接用, .model/.ckpt 自动识别 v1/v2 导出 torchscript
+# Reuse elo.py's model loading: .pt is used directly, .model/.ckpt are
+# auto-detected as v1/v2 and exported to torchscript.
 from elo import prepare_model_path
 from game import Game
 from player import AlphaZeroPlayer
 
+# Default MCTS worker threads: one per local CPU core.
+DEFAULT_CORES = os.cpu_count() or 1
 
-# 用 basename 做显示名; 重名时追加序号
+
+# Use the basename as display name; append a sequence number on collision.
 def make_labels(paths):
-    import os
     labels = [os.path.basename(p) for p in paths]
     seen = defaultdict(int)
     out = []
@@ -37,26 +42,27 @@ def main():
         description='Round-robin league between gomoku models (AlphaZero players).',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--models', required=True,
-                        help='逗号分隔的模型路径列表(.model/.ckpt/.pt)')
+                        help='comma-separated list of model paths (.model/.ckpt/.pt)')
     parser.add_argument('--board-size', type=int, default=11, choices=[8, 11, 15],
-                        help='棋盘边长(8/11/15, 与模型的网络输入尺寸一致)')
+                        help='board edge length (8/11/15, must match the models\' network input size)')
     parser.add_argument('--games', type=int, default=10,
-                        help='每对模型的对局数(建议偶数, 执黑执白各一半)')
-    parser.add_argument('--simulations', type=int, default=1000, help='每手 MCTS 模拟次数')
-    parser.add_argument('--c-puct', type=float, default=5.0, help='PUCT 常数')
-    parser.add_argument('--cores', type=int, default=16, help='每个模型的搜索线程数')
+                        help='games per model pair (an even number is recommended so black/white are split evenly)')
+    parser.add_argument('--simulations', type=int, default=1000, help='MCTS simulations per move')
+    parser.add_argument('--c-puct', type=float, default=5.0, help='PUCT constant')
+    parser.add_argument('--cores', type=int, default=DEFAULT_CORES,
+                        help='search threads per model (default: local CPU count)')
     parser.add_argument('--reuse-states', action=argparse.BooleanOptionalAction, default=True,
-                        help='复用搜索树')
+                        help='reuse the search tree across moves')
     args = parser.parse_args()
 
     model_paths = [p.strip() for p in args.models.split(',') if p.strip()]
     n = len(model_paths)
     if n < 2:
-        parser.error('至少需要 2 个模型')
+        parser.error('at least 2 models are required')
     if args.games <= 0:
-        parser.error('--games 必须为正')
+        parser.error('--games must be positive')
     if args.games % 2 != 0:
-        print(f'Warning: 每对 {args.games} 局为奇数, 黑白分配不完全均衡。', file=sys.stderr)
+        print(f'Warning: odd games per pair ({args.games}), black/white split is not balanced.', file=sys.stderr)
 
     labels = make_labels(model_paths)
     players = []
@@ -71,7 +77,8 @@ def main():
         print(f'  {label}: {path}', file=sys.stderr)
 
     game = Game(args.board_size, args.board_size)
-    # records[i][j] = [胜, 负, 和] (i 的视角, i 对 j); matrix[i][j] = i 从 j 身上拿到的分
+    # records[i][j] = [win, lose, draw] (from i's perspective, i vs j);
+    # matrix[i][j] = points i scored against j.
     records = [[[0, 0, 0] for _ in range(n)] for _ in range(n)]
     matrix = [[0.0] * n for _ in range(n)]
     start_time = time.time()
@@ -84,7 +91,7 @@ def main():
                 players[j].reset()
                 black, white = (i, j) if g % 2 == 0 else (j, i)
                 winner, steps = game.start_play(players[black], players[white])
-                # winner: 0=黑胜, 1=白胜, -1=和; 换算成分数
+                # winner: 0=black wins, 1=white wins, -1=draw; map to points
                 if winner == -1:
                     matrix[i][j] += 0.5
                     matrix[j][i] += 0.5
@@ -109,7 +116,7 @@ def main():
     total_games = args.games * (n - 1)
     wld = [[sum(records[i][j][k] for j in range(n)) for k in range(3)] for i in range(n)]
 
-    # ---- 积分排名表 ----
+    # ---- Score ranking table ----
     ranking = sorted(range(n), key=lambda i: -total_scores[i])
     headers = ['Rank', 'Model', 'Score', 'Win', 'Lose', 'Draw', 'WinRate']
     rows = [[str(r + 1), labels[i], f'{total_scores[i]:g} / {total_games}',
@@ -121,7 +128,7 @@ def main():
     print(f'Total games: {args.games * n * (n - 1) // 2}, '
           f'total time: {total_time:.1f}s ({total_time / 60:.1f}min)')
 
-    # ---- 两两对战得分矩阵: 单元格 = 行模型从列模型身上拿到的分 ----
+    # ---- Head-to-head score matrix: cell = points the row model scored against the column model ----
     print(f'\n===== Head-to-head scores (row vs column, {args.games} games per pair) =====')
     headers = [''] + labels
     rows = []

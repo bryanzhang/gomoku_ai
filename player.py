@@ -5,11 +5,12 @@ import gomoku_ai
 import numpy as np
 import sys
 
-# 按棋盘尺寸选 C++ 绑定类(如 board_size=15 -> PureMCTSFramework15 / AlphaZeroMCTSFramework15)
+# Pick the C++ binding class by board size (e.g. board_size=15 ->
+# PureMCTSFramework15 / AlphaZeroMCTSFramework15)
 def _framework_class(prefix, board_size):
     cls = getattr(gomoku_ai, f'{prefix}{board_size}', None)
     if cls is None:
-        raise ValueError(f'gomoku_ai 不支持 {board_size}x{board_size} 棋盘(没有 {prefix}{board_size} 绑定)')
+        raise ValueError(f'gomoku_ai does not support {board_size}x{board_size} boards (no {prefix}{board_size} binding)')
     return cls
 
 class PureMCTSPlayer:
@@ -30,9 +31,11 @@ class PureMCTSPlayer:
         else:
             is_last_black = (np_board[x][y] == 1)
 
-        # NOTE(junhaozhang): C++ 侧状态包含所有已落子(构造按含 last_move 的完整棋盘,
-        # Play 落每一手), 与 AlphaZeroPlayer 一致, 这里要拿完整棋盘做 StateEquals,
-        # 不能把 last_move 的子摘掉(摘掉既会失配, 也会腐蚀 Game 的 board 引用)。
+        # NOTE(junhaozhang): the C++ side state includes every stone played
+        # (constructed with the full board including last_move, then Play for
+        # each move), same as AlphaZeroPlayer. StateEquals must therefore be
+        # checked against the full board -- do NOT remove the last_move stone
+        # (removing it would both mismatch and corrupt Game's board reference).
         if not self.game:
             self.game = self.framework_cls(self.cores, np_board, last_move, self.c_puct, self.reuse_states)
         elif not self.game.StateEquals(np_board, is_last_black):
@@ -53,13 +56,16 @@ class PureMCTSPlayer:
         return False, False
 
     def reset(self):
-        # 有 framework 时只清搜索树、保留线程池(C++ Reset), 避免每局重建 16 个线程;
-        # game 为 None 时保持惰性构造(首次 get_action 按当时棋盘建, 支持中途入局)。
+        # If the framework exists, only clear the search tree but keep the
+        # thread pool (C++ Reset), avoiding rebuilding the thread pool every
+        # game; if game is None, keep lazy construction (the first get_action
+        # builds from the board at that moment, supporting joining mid-game).
         if self.game:
             self.game.Reset()
 
     def play(self, move):
-        # 还没轮到自己走过棋时 game 尚未创建, 首次 get_action 会直接按当前棋盘构建
+        # game may not exist yet before this player's first move; the first
+        # get_action will construct it from the current board directly.
         if not self.game:
             return False, False
         self.game.Play(move[0], move[1])
@@ -68,7 +74,8 @@ class PureMCTSPlayer:
         return True, self.game.AvailableCount() > 0
 
 class AlphaZeroPlayer:
-    # temperature 小于该阈值就当作 τ→0 处理, 直接走访问次数最多的一手
+    # Temperatures below this threshold are treated as tau->0: play the most
+    # visited move directly.
     GREEDY_TEMP = 1e-2
 
     def __init__(self, board_size, simulate_times, model_path, cores, c_puct, reuse_states):
@@ -87,8 +94,10 @@ class AlphaZeroPlayer:
             return True, True
         return False, False
 
-    # 把 τ=1 的访问次数分布按温度重整成"选点分布": p'∝ p^(1/τ)
-    # τ→0 时退化成 argmax(并列随机), 避免 exp(log(p)/1e-3) 直接下溢
+    # Reshape the tau=1 visit-count distribution into a move-selection
+    # distribution by temperature: p' ∝ p^(1/tau).
+    # Degenerates to argmax (random among ties) as tau->0, avoiding the
+    # underflow of exp(log(p)/1e-3).
     @classmethod
     def selection_probs(cls, visit_probs, temperature):
         if temperature <= cls.GREEDY_TEMP:
@@ -102,9 +111,11 @@ class AlphaZeroPlayer:
         probs = np.exp(logits - logits.max())
         return probs / probs.sum()
 
-    # NOTE(junhaozhang): MCTS 固定按 temperature=1.0 返回访问次数归一化分布, 它是
-    # policy head 的训练目标(与 AlphaZero 一致, 存的永远是 N/ΣN); 入参 temperature
-    # 只决定"这一手实际怎么选", 不会污染训练目标。
+    # NOTE(junhaozhang): MCTS always returns the normalized visit-count
+    # distribution at temperature=1.0, which is the training target of the
+    # policy head (same as AlphaZero -- what is stored is always N/sum(N));
+    # the `temperature` argument only decides how THIS move is actually
+    # picked and never pollutes the training target.
     def get_action(self, np_board, last_move, temperature=1e-3, return_prob=True, self_play=False):
         x = last_move[0]
         y = last_move[1]
@@ -121,11 +132,13 @@ class AlphaZeroPlayer:
 
         move_probs = np.zeros(self.board_size * self.board_size)
         sensible_moves, sensible_probs = self.game.SearchBestMove(self.simulate_times, self.model_path, 1.0)
-        move_probs[sensible_moves] = sensible_probs  # 训练目标: 始终是 τ=1 的访问次数分布
+        move_probs[sensible_moves] = sensible_probs  # training target: always the tau=1 visit-count distribution
         visit_probs = np.array(sensible_probs)
         select_probs = self.selection_probs(visit_probs, temperature)
-        # 只在探索阶段(τ 较大)注入 Dirichlet 噪声。τ→0 的贪心阶段再加 25% 噪声等于
-        # 隔几手就故意走一步废棋, 会把 value 目标 z 打成噪声标签。
+        # Inject Dirichlet noise only during the exploration phase (large
+        # tau). Adding 25% noise in the greedy tau->0 phase would
+        # deliberately play a wasted move every few plies, turning the value
+        # target z into a noisy label.
         if self_play and temperature > self.GREEDY_TEMP:
             select_probs = 0.75 * select_probs + 0.25 * np.random.dirichlet(0.3 * np.ones(len(select_probs)))
         move = np.random.choice(sensible_moves, p=select_probs)
@@ -135,9 +148,12 @@ class AlphaZeroPlayer:
         return move, move_probs
 
     def reset(self):
-        # NOTE(junhaozhang): 不能每局新建 Framework —— 新线程池产生新 thread id,
-        # C++ ThreadLocalModels 会按 thread id 永久累积 torch 模块(每局 +cores 份,
-        # 打几局就 OOM)。Reset 只清搜索树, 线程池与模型缓存跨局复用。
+        # NOTE(junhaozhang): do NOT create a new Framework per game -- a new
+        # thread pool yields new thread ids, and the C++ ThreadLocalModels
+        # would permanently accumulate torch modules keyed by thread id
+        # (+cores copies per game, OOM after a few games). Reset only clears
+        # the search tree; the thread pool and model cache are reused across
+        # games.
         self.game.Reset()
 
     def play(self, move):

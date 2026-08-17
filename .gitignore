@@ -5,3 +5,10 @@ build
 core
 web_server
 __pycache__
+
+# training artifacts (paths produced by train.py)
+current_policy*.ckpt
+current_policy*.model
+gomoku_experiments*/
+/*x*_snapshots/
+train_curve.png

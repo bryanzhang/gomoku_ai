@@ -4,26 +4,30 @@ import sys
 import numpy as np
 
 class Game:
-    # board 按 [x][y] 索引(与 player/C++ 侧的 Move=(x,y) 一致), 宽=board_width, 高=board_height
+    # The board is indexed [x][y] (consistent with Move=(x,y) on the
+    # player/C++ side); width=board_width, height=board_height.
     def __init__(self, board_width=11, board_height=11):
         self.board_width = board_width
         self.board_height = board_height
         self.board = np.zeros((board_width, board_height), dtype=np.int32)
 
-    # 返回赢家和步数
-    # NOTE(junhaozhang): 开局必须清空棋盘, 否则连续多局评估时会带着上一局的残局开打。
-    # 两个 player 自身的搜索树需要调用方在每局前 reset()。
+    # Returns (winner, steps).
+    # NOTE(junhaozhang): the board must be cleared at game start, otherwise
+    # consecutive evaluation games would be played on the previous game's
+    # final position. Each player's own search tree must be reset() by the
+    # caller before every game.
     def start_play(self, black_player, white_player):
         self.board = np.zeros((self.board_width, self.board_height), dtype=np.int32)
         players = [ black_player, white_player ]
         last_move = (-1, -1)
-        current_player = 0 # 总是黑棋先下
+        current_player = 0 # black always moves first
         steps = 0
         while True:
             player_in_turn = players[current_player]
             move = player_in_turn.get_action(self.board, last_move, return_prob=False)
-            # NOTE(junhaozhang): 双方的搜索树都要落这一手, 否则对手下一次
-            # get_action 里的 StateEquals 会失配(它只认自己走过的那些子)。
+            # NOTE(junhaozhang): both players' search trees must apply this
+            # move, otherwise StateEquals in the opponent's next get_action
+            # will mismatch (it only recognizes the moves it has seen).
             for player in players:
                 player.play(move)
             last_move = move
@@ -35,11 +39,15 @@ class Game:
                 return winner, steps
             current_player = 1 - current_player
 
-    # NOTE(junhaozhang): 前 temp_moves 手用 temperature=1.0 按访问次数采样, 保证开局
-    # 多样性; 之后切到 τ→0 直接走最强手, 让胜负由棋力决定而不是由随机走子决定, 这样
-    # value 目标 z 才干净(AlphaGo Zero 在 19x19 上是前 30 手)。
-    # 注意: 无论哪个阶段, 存进训练数据的 mcts_probs 都是 MCTS 在 τ=1 下的访问次数
-    # 分布 —— 那才是 policy head 的监督信号, 换成 one-hot 会把策略头训崩。
+    # NOTE(junhaozhang): the first temp_moves plies sample from visit counts
+    # with temperature=1.0 for opening diversity; afterwards switch to tau->0
+    # (play the strongest move), so the game outcome is decided by playing
+    # strength rather than random moves -- this keeps the value target z clean
+    # (AlphaGo Zero uses the first 30 plies on 19x19).
+    # Note: in either phase, the mcts_probs stored as training data are always
+    # the MCTS visit-count distribution at tau=1 -- that is the supervision
+    # signal for the policy head; replacing it with one-hot would corrupt the
+    # policy head training.
     def start_self_play(self, player, temperature=1.0, temp_moves=10):
         states, mcts_probs, current_players = [], [], [] 
         last_move = (-1, -1)
@@ -71,20 +79,21 @@ class Game:
                 return winner, zip(states, mcts_probs, winners_z)
             current_player = 1 - current_player
 
-    # current_player 0是黑棋，1是白棋
-    # NOTE(junhaozhang): 平面必须按 [y][x] 索引, 与 C++ GenModelInputTensor 以及
-    # policy 平铺下标 idx = y * W + x 保持一致。self.board 是 [x][y] 索引, 故需转置。
-    #   通道0: 当前玩家的棋子位置
-    #   通道1: 对手玩家的棋子位置
-    #   通道2: 上一步落子位置
-    #   通道3: 下一步谁下(黑棋为全1.0)
+    # current_player: 0 = black, 1 = white
+    # NOTE(junhaozhang): the planes must be indexed [y][x], consistent with
+    # the C++ GenModelInputTensor and the policy flattening idx = y * W + x.
+    # self.board is indexed [x][y], hence the transpose.
+    #   channel 0: current player's stones
+    #   channel 1: opponent's stones
+    #   channel 2: last move position
+    #   channel 3: side to move (all 1.0 if black is next)
     def __get_board_input_tensor(self, last_move, current_player):
         state = np.zeros((4, self.board_height, self.board_width))
-        me = 1 if current_player == 0 else -1  # 棋子编码: 黑棋+1, 白棋-1
+        me = 1 if current_player == 0 else -1  # stone encoding: black +1, white -1
         state[0] = (self.board == me).T.astype(np.float64)
         state[1] = (self.board == -me).T.astype(np.float64)
         if last_move[0] >= 0 and last_move[1] >= 0:
             state[2][last_move[1]][last_move[0]] = 1.0
-        if current_player == 0:  # 轮到黑棋
+        if current_player == 0:  # black to move
             state[3][:,:] = 1.0
         return state

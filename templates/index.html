@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>五子棋对战 AI</title>
+    <title>Gomoku vs AI</title>
     <style>
         canvas {
             border: 1px solid #000;
@@ -21,30 +21,30 @@
     </style>
 </head>
 <body>
-    <h1>五子棋对战 AI</h1>
+    <h1>Gomoku vs AI</h1>
 
     <div id="config-panel">
         <div>
             <span class="item">AI:
                 <select id="ai_type">
-                    <option value="model">策略价值网络</option>
-                    <option value="pure">纯 MCTS</option>
+                    <option value="model">Policy-Value Network</option>
+                    <option value="pure">Pure MCTS</option>
                 </select>
             </span>
-            <span class="item">模型: <input type="text" id="model" placeholder="缺省用命令行默认模型"></span>
-            <span class="item">执子:
+            <span class="item">Model: <input type="text" id="model" placeholder="defaults to the command-line model"></span>
+            <span class="item">Play as:
                 <select id="human_color">
-                    <option value="1">执黑(先行)</option>
-                    <option value="-1">执白</option>
+                    <option value="1">Black (first)</option>
+                    <option value="-1">White</option>
                 </select>
             </span>
         </div>
         <div>
-            <span class="item">模拟次数: <input type="number" id="simulate_times" min="1"></span>
+            <span class="item">Simulations: <input type="number" id="simulate_times" min="1"></span>
             <span class="item">c_puct: <input type="number" id="c_puct" step="0.1" min="0.01"></span>
-            <span class="item">线程数: <input type="number" id="cores" min="1"></span>
-            <span class="item"><label><input type="checkbox" id="reuse_states" checked>复用搜索树</label></span>
-            <span class="item"><button id="new_game">开始新局</button></span>
+            <span class="item">Threads: <input type="number" id="cores" min="1"></span>
+            <span class="item"><label><input type="checkbox" id="reuse_states" checked>Reuse search tree</label></span>
+            <span class="item"><button id="new_game">New Game</button></span>
         </div>
     </div>
 
@@ -59,15 +59,15 @@
         const aiTypeSel = document.getElementById('ai_type');
         const modelInput = document.getElementById('model');
 
-        let boardSize = 11; // 棋盘边长, 页面加载后由 /config 下发(11 或 15)
+        let boardSize = 11; // board edge length, pushed by /config after page load (11 or 15)
         let cellSize = canvas.width / boardSize;
 
-        let board = []; // 前端的棋盘状态: 1=黑, -1=白, 0=空
+        let board = []; // frontend board state: 1=black, -1=white, 0=empty
         let gameOver = false;
-        let humanColor = 1;   // 1=玩家执黑, -1=玩家执白
+        let humanColor = 1;   // 1 = human plays black, -1 = human plays white
         let aiColor = -1;
 
-        // 初始化棋盘
+        // Initialize the board
         function initBoard() {
             board = [];
             for (let i = 0; i < boardSize; i++) {
@@ -81,7 +81,7 @@
             drawBoard();
         }
 
-        // 绘制棋盘
+        // Draw the board
         function drawBoard() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             for (let i = 0; i < boardSize; i++) {
@@ -106,7 +106,7 @@
             }
         }
 
-        // 绘制棋子 (isBlack: true 黑棋, false 白棋)
+        // Draw a stone (isBlack: true for black, false for white)
         function drawPiece(x, y, isBlack) {
             ctx.beginPath();
             ctx.arc(
@@ -136,14 +136,14 @@
             ctx.fill();
         }
 
-        // 落下 AI 的一手
+        // Play the AI's move on the board
         function placeAiMove(ai_move) {
             const [ai_x, ai_y] = ai_move;
             board[ai_x][ai_y] = aiColor;
             drawBoard();
         }
 
-        // 处理鼠标点击事件
+        // Handle mouse click events
         canvas.onclick = function(e) {
             if (gameOver) return;
             const rect = canvas.getBoundingClientRect();
@@ -152,7 +152,7 @@
 
             if (board[x][y] !== 0) return;
 
-            // 玩家落子
+            // The human plays a move
             board[x][y] = humanColor;
             drawBoard();
 
@@ -164,20 +164,20 @@
             .then(response => response.json())
             .then(data => {
                 if (data.result === 'win') {
-                    message.textContent = '你赢了！';
+                    message.textContent = 'You win!';
                     gameOver = true;
                 } else if (data.result === 'lose') {
                     placeAiMove(data.ai_move);
-                    message.textContent = 'AI赢了！';
+                    message.textContent = 'AI wins!';
                     gameOver = true;
                 } else if (data.result === 'continue') {
                     placeAiMove(data.ai_move);
                     if (data.status === 'draw') {
-                        message.textContent = '平局！';
+                        message.textContent = 'Draw!';
                         gameOver = true;
                     }
                 } else if (data.result === 'draw') {
-                    message.textContent = '平局！';
+                    message.textContent = 'Draw!';
                     gameOver = true;
                 }
             })
@@ -186,13 +186,14 @@
             });
         };
 
-        // AI 类型切换时启停模型输入框
+        // Enable/disable the model input when the AI type changes
         function syncModelInput() {
             modelInput.disabled = (aiTypeSel.value !== 'model');
         }
         aiTypeSel.onchange = syncModelInput;
 
-        // 开始新局: 携带当前配置; 玩家执白时服务器会返回 AI 的首手
+        // New game: send the current config; when the human plays white, the
+        // server returns the AI's first move.
         newGameBtn.onclick = function() {
             const cfg = {
                 ai_type: aiTypeSel.value,
@@ -203,7 +204,7 @@
                 reuse_states: document.getElementById('reuse_states').checked,
                 human_color: parseInt(document.getElementById('human_color').value)
             };
-            message.textContent = 'AI 思考首手中...';
+            message.textContent = 'AI is thinking about the opening move...';
             fetch('/new_game', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -212,7 +213,7 @@
             .then(response => response.json())
             .then(data => {
                 if (data.result !== 'ok') {
-                    message.textContent = '开局失败: ' + (data.message || '未知错误');
+                    message.textContent = 'Failed to start a new game: ' + (data.message || 'unknown error');
                     return;
                 }
                 humanColor = cfg.human_color;
@@ -220,16 +221,17 @@
                 initBoard();
                 if (data.ai_move) {
                     placeAiMove(data.ai_move);
-                    message.textContent = 'AI 已落子, 轮到你了';
+                    message.textContent = 'AI has moved, your turn';
                 }
             })
             .catch(error => {
-                message.textContent = '开局请求失败';
+                message.textContent = 'New game request failed';
                 console.error('Error:', error);
             });
         };
 
-        // 页面加载: 拉取服务器默认配置预填表单(含棋盘尺寸, 不同则重建棋盘)
+        // On page load: fetch the server's default config to prefill the form
+        // (including the board size; rebuild the board if it differs).
         fetch('/config')
         .then(response => response.json())
         .then(cfg => {

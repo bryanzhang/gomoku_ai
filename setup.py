@@ -4,29 +4,42 @@ import os
 from setuptools import setup, Extension
 import pybind11
 
-# NOTE(junhaozhang): distutils 会忽略 Extension(language='clang++') 而默认用 g++。
-# 本工程的手写指针打包代码(children_ 高 16 位存 idx)在 g++ -O3 严格别名优化下会被
-# 误编译(运行时 RolloutWithModel 段错误), 必须用 clang++ 构建, 故在此强制默认。
+# NOTE(junhaozhang): distutils ignores Extension(language='clang++') and
+# defaults to g++. The hand-written pointer packing in this project (the
+# high 16 bits of children_ store the move index) is miscompiled by g++ -O3
+# strict-aliasing optimizations (RolloutWithModel segfaults at runtime), so
+# clang++ must be used -- force it as the default here.
 os.environ.setdefault('CC', 'clang')
 os.environ.setdefault('CXX', 'clang++')
+
+import torch  # used to locate libtorch headers and shared libraries
+
+torch_dir = os.path.dirname(torch.__file__)
+torch_include = os.path.join(torch_dir, 'include')
+torch_lib = os.path.join(torch_dir, 'lib')
 
 ext_modules = [
     Extension(
         'gomoku_ai',
         ['alphazero_mcts.cpp'],
-        include_dirs=[pybind11.get_include(), '/usr/local/lib/python3.9/dist-packages/torch/include/'],
+        include_dirs=[pybind11.get_include(), torch_include],
         libraries=['stdc++',],
-        library_dirs=['/usr/local/lib', '/usr/local/lib/python3.9/dist-packages/torch/lib'],
+        library_dirs=['/usr/local/lib', torch_lib],
         language='clang++',
         #language='g++',
         #extra_compile_args=['-x', 'c++', '-std=c++17', '-g', '-O3', '-fPIC', '-fsanitize=address', '-fno-omit-frame-pointer'],
         extra_compile_args=['-x', 'c++', '-std=c++17', '-g', '-O3', '-fPIC',],
-        # NOTE(junhaozhang): 必须保留 torch 库的 NEEDED 项——Debian 链接器默认 --as-needed
-        # 会把它们丢掉, 导致 .so 里的 AutogradMeta vtable 等符号在加载时找不到定义
-        # (定义在 libtorch_cpu, 由 import torch 时 RTLD_GLOBAL 加载的 libtorch_cuda 带入全局)。
-        # NOTE(junhaozhang): -lgomp 解析 RolloutWithModel 里的 omp_set_num_threads
-        # (关掉 oneDNN conv 的 OMP 并行, 见 hpp 注释); 运行时复用 torch 已加载的 libgomp。
-        extra_link_args=['-g', '-Wl,--no-as-needed', '-L/usr/local/lib', '-lfolly', '-ldl', '-lgflags', '-lglog', '-lpthread', '-lfmt', '-lunwind', '-ldouble-conversion', '-liberty', '-lstdc++', '-levent', '-lboost_context', '-lgomp', '-L/usr/local/lib/python3.9/dist-packages/torch/lib', '-ltorch_cuda', '-lc10_cuda', '-ltorch_global_deps', '-ltorch', '-lc10',],
+        # NOTE(junhaozhang): the NEEDED entries of the torch libraries must
+        # be kept -- Debian's linker defaults to --as-needed and would drop
+        # them, leaving symbols such as the AutogradMeta vtable in the .so
+        # undefined at load time (defined in libtorch_cpu, pulled into the
+        # global scope by libtorch_cuda which is loaded with RTLD_GLOBAL on
+        # `import torch`).
+        # NOTE(junhaozhang): -lgomp resolves omp_set_num_threads in
+        # RolloutWithModel (disables OMP parallelism of oneDNN conv; see the
+        # comments in the hpp); at runtime it reuses the libgomp already
+        # loaded by torch.
+        extra_link_args=['-g', '-Wl,--no-as-needed', '-L/usr/local/lib', '-lfolly', '-ldl', '-lgflags', '-lglog', '-lpthread', '-lfmt', '-lunwind', '-ldouble-conversion', '-liberty', '-lstdc++', '-levent', '-lboost_context', '-lgomp', f'-L{torch_lib}', '-ltorch_cuda', '-lc10_cuda', '-ltorch_global_deps', '-ltorch', '-lc10', f'-Wl,-rpath,{torch_lib}'],
     ),
 ]
 

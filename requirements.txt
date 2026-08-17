@@ -1,0 +1,10 @@
+# Python dependencies of gomoku_ai.
+# Tested with: python 3.9, torch 2.8.0, numpy 1.24.3, pybind11 3.0.1,
+#              tensorboard 2.13.0, matplotlib 3.7.1
+torch>=1.10
+numpy>=1.20
+pybind11>=2.6
+tensorboard>=2.0      # training logs (train.py) and curve plotting (plot_train_curve.py)
+matplotlib>=3.3       # plot_train_curve.py only
+flask>=2.0            # legacy web.py demo server (the C++ web_server is the primary one)
+flask-cors>=3.0

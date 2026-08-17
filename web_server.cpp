@@ -14,7 +14,7 @@
 #include <utility>
 #include <filesystem>
 #include <unistd.h>
-#include <pybind11/embed.h>  // 需要包含这个头文件
+#include <pybind11/embed.h>  // required for the embedded Python interpreter
 
 
 #include "crow.h"
@@ -24,23 +24,32 @@
 using json = nlohmann::json;
 using Move = gomoku_ai::Move;
 
-// 棋盘尺寸在编译期实例化(搜索树节点是模板), 运行期由 --board-size 分派到对应实例
+// The board size is instantiated at compile time (search tree nodes are
+// templates); at runtime --board-size dispatches to the matching instance.
 constexpr int DEFAULT_BOARD_SIZE = 11;
 
-// 纯 MCTS 无网络先验, 需要大量 rollout 才有棋力; AlphaZero 靠策略价值网络, 1000 次足够。
+// Pure MCTS has no network prior and needs a huge number of rollouts to play
+// well; AlphaZero relies on the policy-value net, so 1000 is enough.
 constexpr int DEFAULT_PURE_MCTS_SIMULATE_TIMES = 1000000;
 constexpr int DEFAULT_ALPHAZERO_SIMULATE_TIMES = 1000;
-// temperature 越小越接近 argmax(visits), 对局(非自对弈)时取一个很小的值。
+// The smaller the temperature, the closer to argmax(visits); use a very
+// small value for match play (as opposed to self-play).
 constexpr float DEFAULT_ALPHAZERO_TEMPERATURE = 0.001f;
 constexpr float DEFAULT_PURE_MCTS_C_PUCT = 2.0f;
 constexpr float DEFAULT_ALPHAZERO_C_PUCT = 5.0f;
 
+// Number of search worker threads: defaults to the local CPU core count.
+inline int DefaultCores() {
+    unsigned int n = std::thread::hardware_concurrency();
+    return n > 0 ? (int)n : 1;
+}
+
 struct ServerConfig {
-    std::string model_path;      // 非空 -> 启用 AlphaZero(MCTS + 策略价值网络); 空 -> 纯 MCTS
-    int simulate_times = -1;     // <0 表示按 AI 类型取默认值
+    std::string model_path;      // non-empty -> AlphaZero (MCTS + policy-value net); empty -> pure MCTS
+    int simulate_times = -1;     // <0 means use the default for the AI type
     float temperature = DEFAULT_ALPHAZERO_TEMPERATURE;
-    float c_puct = -1.0f;        // <0 表示按 AI 类型取默认值
-    int cores = 16;
+    float c_puct = -1.0f;        // <0 means use the default for the AI type
+    int cores = DefaultCores();
     int port = 7000;
     int board_size = DEFAULT_BOARD_SIZE;
     bool reuse_tree_states = true;
@@ -48,31 +57,32 @@ struct ServerConfig {
     bool UseModel() const { return !model_path.empty(); }
 };
 
-// 每盘可改的对局配置(/new_game 接口传入, 缺省字段沿用当前值); 初始值继承命令行。
-// model_path 为空 -> 纯 MCTS; 非空 -> AlphaZero(策略价值网络)。
+// Per-game config, changeable via the /new_game API (missing fields keep
+// their current values); initial values are inherited from the command line.
+// model_path empty -> pure MCTS; non-empty -> AlphaZero (policy-value net).
 struct GameConfig {
     std::string model_path;
     int simulate_times = 0;
     float c_puct = 0.0f;
     bool reuse_tree_states = true;
-    int cores = 16;
-    int human_color = 1;         // 1=玩家执黑先行(默认), -1=玩家执白(AI 先行)
+    int cores = DefaultCores();
+    int human_color = 1;         // 1 = human plays black and moves first (default), -1 = human plays white (AI moves first)
 };
 
-// 在程序启动时初始化Python解释器
+// Initialize the Python interpreter at program start.
 bool init_python_environment() {
     if (!Py_IsInitialized()) {
-        std::cout << "初始化Python解释器..." << std::endl;
+        std::cout << "Initializing Python interpreter..." << std::endl;
         py::initialize_interpreter();
     } else {
-        std::cout << "Python解释器已初始化" << std::endl;
+        std::cout << "Python interpreter already initialized" << std::endl;
     }
 
-    // 检查GIL状态
+    // Check GIL state
     // PyGILState_STATE gstate = PyGILState_GetThisThreadState();
     auto gstate = PyGILState_GetThisThreadState();
     if (gstate == NULL) {
-        std::cout << "当前线程没有附加到解释器" << std::endl;
+        std::cout << "Current thread is not attached to the interpreter" << std::endl;
     }
 
     return Py_IsInitialized();
@@ -95,8 +105,10 @@ inline std::mt19937& GetThreadLocalEngine() {
     return engine;
 }
 
-// 统一 server 端 AI 的接口: 纯 MCTS 与 AlphaZero(MCTS+策略价值网络) 是两个不同的模板实例,
-// 用虚接口擦除类型, 让 GameServer 不用关心具体用哪种 AI。
+// Unified interface for the server-side AI: pure MCTS and AlphaZero
+// (MCTS + policy-value net) are two different template instantiations; the
+// virtual interface erases the type so GameServer need not care which AI is
+// in use.
 class AiEngine {
 public:
     virtual ~AiEngine() = default;
@@ -150,8 +162,10 @@ public:
     const char* Kind() const override { return "alphazero"; }
     int SimulateTimes() const override { return simulate_times_; }
 
-    // 与 player.py::AlphaZeroPlayer.get_action 一致: 按 MCTS 访问次数的 softmax 概率采样。
-    // temperature 很小时该分布几乎是 one-hot(等价于取访问次数最多的着法)。
+    // Consistent with player.py::AlphaZeroPlayer.get_action: sample from the
+    // softmax distribution over MCTS visit counts. With a very small
+    // temperature this distribution is almost one-hot (equivalent to picking
+    // the most visited move).
     Move SearchBestMove() override {
         auto [sensible_moves, sensible_probs] =
             game_.SearchBestMoveWithModel(simulate_times_, model_path_.c_str(), temperature_);
@@ -174,7 +188,9 @@ public:
 
         size_t picked = argmax;
         if (sum > 0.0) {
-            // 概率分布合法才采样, 否则回退到概率最大的着法, 避免 discrete_distribution 未定义行为。
+            // Sample only when the probability distribution is valid;
+            // otherwise fall back to the argmax move to avoid undefined
+            // behavior of discrete_distribution.
             std::discrete_distribution<size_t> distribution(sensible_probs.begin(), sensible_probs.end());
             picked = distribution(GetThreadLocalEngine());
         } else {
@@ -206,11 +222,13 @@ inline std::unique_ptr<AiEngine> CreateEngine(const GameConfig& config,
     return std::make_unique<PureMCTSEngine<BOARD_SIZE>>(config, board, last_move);
 }
 
-// 定义在文件后部(main 之前), GameServer 的 /new_game 需要用
+// Defined near the end of the file (before main); needed by GameServer's
+// /new_game.
 std::string ExportToTorchScriptIfNeeded(const std::string& model_path, int board_size);
 bool CheckModel(const std::string& model_path, int board_size);
 
-// 对 Crow 路由暴露的棋盘尺寸无关接口, main 按 --board-size 实例化 GameServerT<11/15>
+// Board-size-agnostic interface exposed to the Crow routes; main
+// instantiates GameServerT<11/15> according to --board-size.
 class IGameServer {
 public:
     virtual ~IGameServer() = default;
@@ -224,13 +242,15 @@ template <int BOARD_SIZE>
 class GameServerT : public IGameServer {
 private:
     ServerConfig config_;
-    GameConfig gameCfg_;          // 当前对局配置(可被 /new_game 每盘修改)
+    GameConfig gameCfg_;          // current per-game config (changeable by /new_game)
     std::unique_ptr<AiEngine> currentGame;
     std::mutex gameMutex;
-    // .model/.ckpt 转 torchscript 的单条目缓存: 同一源路径不重复导出
+    // Single-entry cache for .model/.ckpt -> torchscript conversion: the
+    // same source path is never exported twice.
     std::string exportCacheSrc_, exportCacheTs_;
 
-    // 解析模型路径(必要时转 torchscript 并校验), 失败返回空串
+    // Resolve the model path (convert to torchscript and validate if
+    // needed); returns an empty string on failure.
     std::string resolveModel(const std::string& path) {
         if (path == exportCacheSrc_) {
             return exportCacheTs_;
@@ -244,7 +264,8 @@ private:
         return ts;
     }
 
-    // AI(黑棋)先行的开局: 空棋盘建引擎, 搜索并落下第一手
+    // Opening when the AI (black) moves first: build the engine on an empty
+    // board, search and play the first move.
     void aiOpenMove(crow::json::wvalue& res) {
         std::vector<std::vector<int>> empty(BOARD_SIZE, std::vector<int>(BOARD_SIZE, 0));
         currentGame = CreateEngine<BOARD_SIZE>(gameCfg_, config_.temperature, empty, { -1, -1 });
@@ -264,7 +285,7 @@ public:
         gameCfg_.human_color = 1;
     }
 
-    // 前端拉取默认配置做表单预填
+    // The frontend fetches the default config to prefill the form.
     void handleGetConfig(crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
         res["board_size"] = BOARD_SIZE;
@@ -277,8 +298,10 @@ public:
         res["ai_type"] = gameCfg_.model_path.empty() ? "pure" : "model";
     }
 
-    // 每盘开局: 可选地携带新配置(ai_type/model/simulate_times/c_puct/reuse_states/
-    // cores/human_color), 缺省字段沿用当前配置。玩家执白时 AI 先行并返回 ai_move。
+    // Start a new game: optionally carries a new config
+    // (ai_type/model/simulate_times/c_puct/reuse_states/cores/human_color);
+    // missing fields keep their current values. When the human plays white,
+    // the AI moves first and ai_move is returned.
     void handleNewGame(const crow::request& req, crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
         if (!req.body.empty()) {
@@ -295,7 +318,7 @@ public:
                 } else if (t == "model" && gameCfg_.model_path.empty()
                            && !(data.contains("model") && !data["model"].get<std::string>().empty())) {
                     res["result"] = "error";
-                    res["message"] = "ai_type=model 但未提供模型路径(命令行也未指定)";
+                    res["message"] = "ai_type=model but no model path was provided (nor given on the command line)";
                     return;
                 }
             }
@@ -305,7 +328,7 @@ public:
                     std::string ts = resolveModel(m);
                     if (ts.empty()) {
                         res["result"] = "error";
-                        res["message"] = "模型加载失败: " + m;
+                        res["message"] = "failed to load model: " + m;
                         return;
                     }
                     gameCfg_.model_path = ts;
@@ -327,7 +350,7 @@ public:
                 int c = data["human_color"].get<int>();
                 if (c != 1 && c != -1) {
                     res["result"] = "error";
-                    res["message"] = "human_color 只能是 1(执黑) 或 -1(执白)";
+                    res["message"] = "human_color must be 1 (black) or -1 (white)";
                     return;
                 }
                 gameCfg_.human_color = c;
@@ -340,7 +363,7 @@ public:
                   << ", human_color=" << gameCfg_.human_color << std::endl;
         res["result"] = "ok";
         if (gameCfg_.human_color == -1) {
-            aiOpenMove(res);  // 玩家执白, AI 执黑先行
+            aiOpenMove(res);  // human plays white; AI plays black and moves first
         }
     }
 
@@ -352,13 +375,15 @@ public:
         int x = data["x"];
         int y = data["y"];
 
-        // 处理人类移动
-        boardArr[x][y] = 0; // 重置为0，因为前端可能已经设置了值
+        // Handle the human move
+        boardArr[x][y] = 0; // reset to 0 because the frontend may have already set it
         std::cout << "Human move: " << x << ", " << y << std::endl;
 
-        // 检查是否需要创建新游戏
-        // 此时棋盘上最后一手是 AI 落的, AI 颜色 = -human_color, 故:
-        // 玩家执黑(human_color=1) -> 上一手是白棋; 玩家执白 -> 上一手是黑棋
+        // Check whether a new game needs to be created.
+        // At this point the last move on the board was made by the AI, whose
+        // color = -human_color, so:
+        // human plays black (human_color=1) -> the last move was white;
+        // human plays white -> the last move was black.
         bool last_black = (gameCfg_.human_color == -1);
         if (!currentGame || !currentGame->StateEquals(boardArr, last_black)) {
             if (IsEmptyBoard(boardArr)) {
@@ -366,13 +391,13 @@ public:
             } else {
                 std::cout << "WARNING: Re-Initializing the game unexpectedly!" << std::endl;
             }
-            boardArr[x][y] = gameCfg_.human_color;  // 落上玩家这一手(黑 1 / 白 -1)
+            boardArr[x][y] = gameCfg_.human_color;  // apply the human's move (black 1 / white -1)
             currentGame = CreateEngine<BOARD_SIZE>(gameCfg_, config_.temperature, boardArr, std::make_pair(x, y));
         } else {
             currentGame->Play(x, y);
         }
 
-        // 检查游戏状态
+        // Check the game state
         if (currentGame->AvailableCount() == 0) {
             std::cout << "Draw!" << std::endl;
             res["result"] = "draw";
@@ -385,7 +410,7 @@ public:
             return;
         }
 
-        // AI移动
+        // AI move
         int search_times = currentGame->SimulateTimes();
         auto start_time = std::chrono::steady_clock::now();
         auto [ai_x, ai_y] = currentGame->SearchBestMove();
@@ -420,7 +445,8 @@ public:
         }
     }
 
-    // 沿用当前配置重开一局; 玩家执白时 AI 先行并返回 ai_move
+    // Restart a game with the current config; when the human plays white,
+    // the AI moves first and ai_move is returned.
     void handleRestart(const crow::request& req, crow::json::wvalue& res) override {
         std::lock_guard<std::mutex> lock(gameMutex);
         currentGame.reset();
@@ -433,7 +459,7 @@ public:
 };
 
 void ServeStaticFiles(crow::SimpleApp& app) {
-    // 提供静态文件服务
+    // Serve static files
     CROW_ROUTE(app, "/")
     ([]() {
         crow::mustache::context ctx;
@@ -451,30 +477,33 @@ void PrintUsage(const char* prog) {
     std::cout
         << "Usage: " << prog << " [model_path] [options]\n"
         << "\n"
-        << "  model_path                TorchScript 模型路径(位置参数, 等价于 --model)。\n"
-        << "                            非空 -> 启用 AlphaZero(MCTS + 策略价值网络);\n"
-        << "                            为空 -> 使用纯 MCTS。\n"
+        << "  model_path                Path to a TorchScript model (positional, equivalent to --model).\n"
+        << "                            Non-empty -> AlphaZero (MCTS + policy-value net);\n"
+        << "                            empty -> pure MCTS.\n"
         << "Options:\n"
-        << "  -m, --model <path>        同上\n"
-        << "  -n, --simulate-times <n>  MCTS 搜索次数, 默认纯 MCTS " << DEFAULT_PURE_MCTS_SIMULATE_TIMES
+        << "  -m, --model <path>        Same as above\n"
+        << "  -n, --simulate-times <n>  MCTS simulations per move; defaults: pure MCTS "
+        << DEFAULT_PURE_MCTS_SIMULATE_TIMES
         << ", AlphaZero " << DEFAULT_ALPHAZERO_SIMULATE_TIMES << "\n"
-        << "  -t, --temperature <f>     AlphaZero 采样温度, 默认 " << DEFAULT_ALPHAZERO_TEMPERATURE << "\n"
-        << "      --c-puct <f>          PUCT 常数, 默认纯 MCTS " << DEFAULT_PURE_MCTS_C_PUCT
+        << "  -t, --temperature <f>     AlphaZero sampling temperature, default "
+        << DEFAULT_ALPHAZERO_TEMPERATURE << "\n"
+        << "      --c-puct <f>          PUCT constant; defaults: pure MCTS " << DEFAULT_PURE_MCTS_C_PUCT
         << ", AlphaZero " << DEFAULT_ALPHAZERO_C_PUCT << "\n"
-        << "  -c, --cores <n>           搜索线程数, 默认 16\n"
-        << "  -p, --port <n>            监听端口, 默认 7000\n"
-        << "  -s, --board-size <n>      棋盘边长, 11 或 15, 默认 " << DEFAULT_BOARD_SIZE << "\n"
-        << "      --no-reuse-tree       不复用上一步的搜索树\n"
-        << "  -h, --help                打印本帮助\n"
+        << "  -c, --cores <n>           Number of search threads, default: local CPU count\n"
+        << "  -p, --port <n>            Listening port, default 7000\n"
+        << "  -s, --board-size <n>      Board edge length, 11 or 15, default " << DEFAULT_BOARD_SIZE << "\n"
+        << "      --no-reuse-tree       Do not reuse the search tree from the previous move\n"
+        << "  -h, --help                Print this help\n"
         << "\n"
-        << "NOTE: 模型支持两种形式:\n"
-        << "      1) TorchScript(.pt), PolicyValueNet.save_model_with_torchscript() 的产物;\n"
-        << "      2) state_dict/checkpoint(.model/.ckpt, 如 current_policy.model),\n"
-        << "         启动时自动按内容识别 v1(3conv)/v2(ResNet) 结构并导出成 .pt 再加载。"
+        << "NOTE: two model forms are supported:\n"
+        << "      1) TorchScript (.pt), produced by PolicyValueNet.save_model_with_torchscript();\n"
+        << "      2) state_dict/checkpoint (.model/.ckpt, e.g. current_policy.model) --\n"
+        << "         at startup the v1 (3conv) / v2 (ResNet) architecture is auto-detected\n"
+        << "         from the content and the weights are exported to .pt before loading."
         << std::endl;
 }
 
-// 支持 "--key value" 与 "--key=value" 两种写法
+// Supports both "--key value" and "--key=value" styles.
 bool ParseArgs(int argc, char** argv, ServerConfig& config) {
     auto next_value = [&](int& i, const std::string& arg, const char* name, std::string& out) {
         auto eq = arg.find('=');
@@ -526,7 +555,7 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
             PrintUsage(argv[0]);
             return false;
         } else if (config.model_path.empty()) {
-            config.model_path = arg;  // 位置参数: 模型路径
+            config.model_path = arg;  // positional argument: model path
         } else {
             std::cerr << "Unexpected argument: " << arg << std::endl;
             PrintUsage(argv[0]);
@@ -534,7 +563,7 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
         }
     }
 
-    // 按 AI 类型补默认值
+    // Fill in defaults according to the AI type
     if (config.simulate_times <= 0) {
         config.simulate_times = config.UseModel() ? DEFAULT_ALPHAZERO_SIMULATE_TIMES
                                                   : DEFAULT_PURE_MCTS_SIMULATE_TIMES;
@@ -557,10 +586,13 @@ bool ParseArgs(int argc, char** argv, ServerConfig& config) {
     return true;
 }
 
-// C++ 侧只认 TorchScript(.pt); .model/.ckpt(state_dict/checkpoint)先借助内嵌 Python
-// 解释器走 load_net_any_arch 自动识别 v1(3conv)/v2(ResNet, 推断 blocks/channels)结构
-// 并导出 .pt。与 elo.py 的 prepare_model_path 同一条路径, 行为保持一致。
-// 返回可用的 .pt 路径; 转换失败返回空串。
+// The C++ side only accepts TorchScript (.pt); .model/.ckpt
+// (state_dict/checkpoint) first go through the embedded Python interpreter
+// via load_net_any_arch, which auto-detects the v1 (3conv) / v2 (ResNet,
+// inferring blocks/channels) architecture and exports a .pt. This is the
+// same code path as elo.py's prepare_model_path, so behavior stays
+// consistent.
+// Returns a usable .pt path; an empty string on conversion failure.
 std::string ExportToTorchScriptIfNeeded(const std::string& model_path, int board_size) {
     if (model_path.size() >= 3 && model_path.substr(model_path.size() - 3) == ".pt") {
         return model_path;
@@ -571,7 +603,7 @@ std::string ExportToTorchScriptIfNeeded(const std::string& model_path, int board
     try {
         py::gil_scoped_acquire gil;
         py::module_ sys = py::module_::import("sys");
-        sys.attr("path").attr("insert")(0, ".");  // policy_value_net_pytorch_v2 与 web_server 同目录
+        sys.attr("path").attr("insert")(0, ".");  // policy_value_net_pytorch_v2 lives next to web_server
         py::module_ pv = py::module_::import("policy_value_net_pytorch_v2");
         py::object net = pv.attr("load_net_any_arch")(board_size, board_size, model_path);
         net.attr("save_model_with_torchscript")(ts_path);
@@ -583,8 +615,9 @@ std::string ExportToTorchScriptIfNeeded(const std::string& model_path, int board
     return ts_path;
 }
 
-// 提前加载一次模型, 把"模型路径写错/不是 TorchScript 文件"这类问题在启动时就暴露出来,
-// 而不是等到第一次落子搜索时才在工作线程里抛异常。
+// Load the model once up front, so that problems like "wrong model path /
+// not a TorchScript file" surface at startup instead of being raised in a
+// worker thread at the first move search.
 bool CheckModel(const std::string& model_path, int board_size) {
     std::ifstream fin(model_path, std::ios::binary);
     if (!fin.good()) {
@@ -607,8 +640,8 @@ bool CheckModel(const std::string& model_path, int board_size) {
         }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load TorchScript model '" << model_path << "': " << e.what() << std::endl;
-        std::cerr << "HINT: 模型必须由 PolicyValueNet.save_model_with_torchscript() 导出(torch.jit), "
-                  << "state_dict(current_policy.model) 无法被 C++ 直接加载。" << std::endl;
+        std::cerr << "HINT: the model must be exported by PolicyValueNet.save_model_with_torchscript() (torch.jit); "
+                  << "a state_dict (current_policy.model) cannot be loaded by C++ directly." << std::endl;
         return false;
     }
     return true;
@@ -643,7 +676,8 @@ int main(int argc, char** argv) {
               << (config.reuse_tree_states ? "true" : "false") << std::endl;
 
     crow::SimpleApp app;
-    // 棋盘尺寸是搜索树模板的编译期参数, 这里按运行期配置分派
+    // The board size is a compile-time parameter of the search-tree
+    // template; dispatch on the runtime config here.
     std::unique_ptr<IGameServer> server_ptr;
     if (config.board_size == 11) {
         server_ptr = std::make_unique<GameServerT<11>>(config);
@@ -652,7 +686,7 @@ int main(int argc, char** argv) {
     }
     IGameServer& server = *server_ptr;
 
-    // 设置路由
+    // Set up routes
     CROW_ROUTE(app, "/handle_state")
         .methods("POST"_method)
         ([&server](const crow::request& req) {
@@ -684,12 +718,14 @@ int main(int argc, char** argv) {
             return res;
         });
 
-    // 静态文件服务
+    // Static file service
     ServeStaticFiles(app);
 
-    // NOTE(junhaozhang): 必须在进入 Crow 事件循环前释放主线程的 GIL!
-    // py::initialize_interpreter() 后主线程一直持有 GIL, 若不释放, /new_game 里
-    // Crow worker 线程的 py::gil_scoped_acquire(模型转换)会永远阻塞(实测卡死)。
+    // NOTE(junhaozhang): the main thread's GIL must be released before
+    // entering the Crow event loop! After py::initialize_interpreter() the
+    // main thread keeps holding the GIL; without releasing it, the
+    // py::gil_scoped_acquire in /new_game (model conversion) on a Crow
+    // worker thread would block forever (observed deadlock in practice).
     py::gil_scoped_release gil_release;
 
     std::cout << "Server running on http://0.0.0.0:" << config.port << std::endl;

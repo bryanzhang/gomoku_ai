@@ -82,18 +82,18 @@ inline std::string format(const char* fmt, ...) {
     va_list args;
     
     va_start(args, fmt);
-    int length = vsnprintf(nullptr, 0, fmt, args); // C++11 标准规定，若buf为nullptr且size为0，则返回所需字节数（不含空终止符）
+    int length = vsnprintf(nullptr, 0, fmt, args); // per C++11, if buf is nullptr and size is 0, returns the number of bytes needed (excluding the null terminator)
     va_end(args);
     
     if (length <= 0) {
-        return ""; // 格式化错误，返回空字符串
+        return ""; // formatting error: return an empty string
     }
     
     size_t buf_size = length + 1;
     std::vector<char> buf(buf_size);
     
     va_start(args, fmt);
-    vsnprintf(buf.data(), buf_size, fmt, args); // 使用vector的data()成员函数获取裸指针
+    vsnprintf(buf.data(), buf_size, fmt, args); // use the vector's data() member to get the raw pointer
     va_end(args);
     
     return std::string(buf.data());
@@ -104,7 +104,7 @@ template <class TYPE>
 struct HPRecType {
    std::atomic<HPRecType<TYPE>*> next_ = nullptr;
    std::atomic<bool> active_ = false;
-   std::atomic<TYPE*> hazard_ = nullptr;  // NOTE(junhaozhang): 并不own!
+   std::atomic<TYPE*> hazard_ = nullptr;  // NOTE(junhaozhang): not owned!
 
    void Release() {
         hazard_ = nullptr;
@@ -251,14 +251,14 @@ private:
 
 template <int BOARD_SIZE>
 struct TreeNode {
-    // 多线程不变部分
+    // Parts that are immutable under multithreading
     TreeNode* parent_;
     std::bitset<BOARD_SIZE * BOARD_SIZE> availables_;
     std::bitset<BOARD_SIZE * BOARD_SIZE> blacks_;
 
-    // 多线程易变部分
-    std::atomic<uint64_t> children_;  // 最高两字节为计数值，避免ABA问题
-    std::atomic<uint64_t> concurrency_visits_score_ = 0;  // 最高1字节代表节点的当前线程并发数量(concurrency), 接着三字节为visits，最低4字节为score
+    // Parts that are mutable under multithreading
+    std::atomic<uint64_t> children_;  // the top two bytes hold a counter to avoid the ABA problem
+    std::atomic<uint64_t> concurrency_visits_score_ = 0;  // top 1 byte: number of threads currently inside the node (concurrency), next 3 bytes: visits, lowest 4 bytes: score
     // float p = 1.0;  // prior probability
 
     TreeNode() : parent_(nullptr) {
@@ -273,7 +273,7 @@ struct TreeNode {
     }
 
     ~TreeNode() {
-        // 不管parent的内存
+        // parent's memory is not managed here
         std::vector<uint64_t>* children = (std::vector<uint64_t>*)(children_ & 0x0000ffffffffffff);
         // std::cerr << format("Reclaim %zu children entries!\n", children->size());
         for (auto itr = children->begin(); itr != children->end(); ++itr) {
@@ -304,7 +304,7 @@ struct TreeNode {
         solid &= not_available;
         int idx = last_move.second * BOARD_SIZE + last_move.first;
 
-        // 横向
+        // Horizontal
         int diff_begin = 0;
         while (last_move.first - diff_begin >= 0 && solid[idx - diff_begin]) { ++diff_begin; }
         int diff_end = 0;
@@ -313,7 +313,7 @@ struct TreeNode {
             return true;
         }
 
-        // 竖向
+        // Vertical
         diff_begin = 0;
         while (last_move.second - diff_begin >= 0 && solid[idx - diff_begin * BOARD_SIZE]) { ++diff_begin; }
         diff_end = 0;
@@ -322,7 +322,7 @@ struct TreeNode {
             return true;
         }
 
-        // 斜向1
+        // Diagonal '\'
         diff_begin = 0;
         while (last_move.first - diff_begin >= 0 && last_move.second - diff_begin >= 0 && solid[idx - diff_begin * (BOARD_SIZE + 1)]) { ++diff_begin; }
         diff_end = 0;
@@ -331,7 +331,7 @@ struct TreeNode {
             return true;
         }
 
-        // 斜向2
+        // Diagonal '/'
         diff_begin = 0;
         while (last_move.first - diff_begin >= 0 && last_move.second + diff_begin < BOARD_SIZE && solid[idx + diff_begin * (BOARD_SIZE - 1)]) { ++diff_begin; }
         diff_end = 0;
@@ -343,7 +343,7 @@ struct TreeNode {
         return false;
     }        
 
-    // 增加1个concurrency
+    // Increment concurrency by 1
     uint64_t WeakLock() {
         uint64_t old_value, new_value;
         do {
@@ -503,13 +503,13 @@ public:
         }
         if (last_move_.first < 0 || last_move_.second < 0) {
             if (root_->availables_.count() != BOARD_SIZE * BOARD_SIZE) {
-                throw std::runtime_error(format("NO last action but there are %d picies on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
+                throw std::runtime_error(format("NO last action but there are %d pieces on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
             }
-            is_last_black_ = false;  // 强要求黑棋先走
+            is_last_black_ = false;  // black is strictly required to move first
         } else {
             int index = last_move_.second * BOARD_SIZE + last_move_.first;
             if (root_->availables_[index]) {
-                throw std::runtime_error(format("The move(%d,%d) hasnot been made!", last_move.first, last_move.second));
+                throw std::runtime_error(format("The move(%d,%d) has not been made!", last_move.first, last_move.second));
             }
             is_last_black_ = root_->blacks_[index];
         }
@@ -539,13 +539,13 @@ public:
         }
         if (last_move_.first < 0 || last_move_.second < 0) {
             if (root_->availables_.count() != BOARD_SIZE * BOARD_SIZE) {
-                throw std::runtime_error(format("NO last action but there are %d picies on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
+                throw std::runtime_error(format("NO last action but there are %d pieces on board!", BOARD_SIZE * BOARD_SIZE - root_->availables_.count()));
             }
-            is_last_black_ = false;  // 强要求黑棋先走
+            is_last_black_ = false;  // black is strictly required to move first
         } else {
             int index = last_move_.second * BOARD_SIZE + last_move_.first;
             if (root_->availables_[index]) {
-                throw std::runtime_error(format("The move(%d,%d) hasnot been made!", last_move.first, last_move.second));
+                throw std::runtime_error(format("The move(%d,%d) has not been made!", last_move.first, last_move.second));
             }
             is_last_black_ = root_->blacks_[index];
         }
@@ -621,7 +621,7 @@ public:
         TreeNode<BOARD_SIZE>* new_root = nullptr;
         int child_idx = y * BOARD_SIZE + x;
         if (!root_->availables_[child_idx]) {
-            throw std::runtime_error(format("(%d,%d) is not avialable!", x, y));
+            throw std::runtime_error(format("(%d,%d) is not available!", x, y));
         }
         if (!reuse_tree_states_) {
             new_root = new TreeNode<BOARD_SIZE>(root_, child_idx, !is_last_black_);
@@ -753,7 +753,7 @@ public:
             rd(),
             static_cast<unsigned int>(std::chrono::steady_clock::now().time_since_epoch().count()),
             static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id())),
-            static_cast<unsigned int>(task_idx)  // 使用任务索引增加随机性
+            static_cast<unsigned int>(task_idx)  // use the task index for extra randomness
         };
     */
         thread_local std::mt19937 engine(rd());

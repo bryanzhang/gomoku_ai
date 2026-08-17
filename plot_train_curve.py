@@ -1,12 +1,14 @@
 #! /usr/bin/python3
 
-# 从 tensorboard event 文件绘制训练曲线, 与 train.py 写入的 tag 对应:
-#   左图: Loss/Train + Entropy/Train(每局自对弈后的训练更新)
-#   右图: Eval/OverallScore + Eval/BlackScore + Eval/WhiteScore(每隔 eval_freq 局评估)
-# 断点续训会产生 step 重叠的 event 文件, 同一 step 保留最后写入的值。
+# Plot training curves from tensorboard event files, matching the tags written
+# by train.py:
+#   left:  Loss/Train + Entropy/Train (training update after each self-play game)
+#   right: Eval/OverallScore + Eval/BlackScore + Eval/WhiteScore (evaluated every eval_freq games)
+# Resumed training produces event files with overlapping steps; for the same
+# step the last written value wins.
 #
-# 用法:
-#   ./plot_train_curve.py                                  # 默认读 ./gomoku_experiments, 输出 ./train_curve.png
+# Usage:
+#   ./plot_train_curve.py                                  # reads ./gomoku_experiments, writes ./train_curve.png
 #   ./plot_train_curve.py --dir ./gomoku_experiments --smooth 50 -o curve.png
 
 import argparse
@@ -14,11 +16,11 @@ import os
 import sys
 
 import matplotlib
-matplotlib.use('Agg')  # 无显示环境
+matplotlib.use('Agg')  # headless environment
 import matplotlib.pyplot as plt
 import numpy as np
 
-# (tag, 显示名, 颜色)
+# (tag, display name, color)
 LOSS_TAGS = [('Loss/Train', 'loss', 'tab:red')]
 ENTROPY_TAGS = [('Entropy/Train', 'entropy', 'tab:orange')]
 EVAL_TAGS = [
@@ -28,7 +30,7 @@ EVAL_TAGS = [
 ]
 
 
-# 读取 dir 下所有 event 文件里指定 tag 的 (step, value) 序列
+# Read the (step, value) series of the given tags from all event files under dir.
 def load_scalars(logdir):
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     ea = EventAccumulator(logdir)
@@ -37,7 +39,7 @@ def load_scalars(logdir):
     series = {}
     for tag in available:
         events = ea.Scalars(tag)
-        # 续训重叠 step 去重: 按写入时间保留最后一个
+        # De-duplicate overlapping steps from resumed runs: keep the last write.
         by_step = {}
         for e in sorted(events, key=lambda e: (e.step, e.wall_time)):
             by_step[e.step] = e.value
@@ -81,21 +83,21 @@ def main():
     parser = argparse.ArgumentParser(
         description='Plot training curves (loss/entropy + eval win ratios) from tensorboard events.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--dir', default='./gomoku_experiments', help='tensorboard event 目录')
-    parser.add_argument('-o', '--output', default='./train_curve.png', help='输出图片路径')
+    parser.add_argument('--dir', default='./gomoku_experiments', help='tensorboard event directory')
+    parser.add_argument('-o', '--output', default='./train_curve.png', help='output image path')
     parser.add_argument('--smooth', type=int, default=20,
-                        help='滑动平均窗口(局数), 0 表示只画原始值')
+                        help='moving average window (in games); 0 plots raw values only')
     args = parser.parse_args()
 
     if not os.path.isdir(args.dir):
-        sys.exit(f'event 目录不存在: {args.dir}')
+        sys.exit(f'event directory does not exist: {args.dir}')
     series = load_scalars(args.dir)
     if not series:
-        sys.exit(f'{args.dir} 里没有 scalar 数据')
+        sys.exit(f'no scalar data in {args.dir}')
 
     fig, (ax_loss, ax_eval) = plt.subplots(1, 2, figsize=(14, 5))
 
-    # 左图: loss / entropy(双 y 轴, 合并图例)
+    # Left: loss / entropy (dual y-axes, merged legend)
     ax_entropy = ax_loss.twinx()
     plot_series(ax_loss, series, LOSS_TAGS, args.smooth, 'loss', legend=False)
     plot_series(ax_entropy, series, ENTROPY_TAGS, args.smooth, 'entropy', legend=False)
@@ -106,7 +108,7 @@ def main():
     ax_loss.set_xlabel('batch (self-play games)')
     ax_loss.set_title('Training loss / entropy')
 
-    # 右图: 评估胜率
+    # Right: evaluation win ratios
     plot_series(ax_eval, series, EVAL_TAGS, 1, 'win ratio')
     ax_eval.set_xlabel('batch (self-play games)')
     ax_eval.set_ylim(-0.05, 1.05)
